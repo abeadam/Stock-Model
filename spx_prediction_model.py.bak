@@ -1,0 +1,743 @@
+"""
+SPX Prediction Model using PyTorch LSTM
+
+Install dependencies:
+    pip install torch pandas numpy scikit-learn
+    OR
+    pip install -r requirements.txt
+"""
+import os
+import pandas as pd
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import train_test_split
+import glob
+from typing import Tuple, List
+import warnings
+import gc  # Garbage collection for memory management
+warnings.filterwarnings('ignore')
+
+# Set random seeds for reproducibility
+torch.manual_seed(42)
+np.random.seed(42)
+
+class StockDataset(Dataset):
+    """Dataset class for time series stock data
+    
+    Memory-efficient: Keeps data as numpy arrays and converts to tensors on-the-fly.
+    This uses less memory than pre-converting everything to tensors.
+    """
+    def __init__(self, sequences, targets):
+        # Keep as numpy arrays to save memory - convert to tensor only when needed
+        self.sequences = sequences  # numpy array
+        self.targets = targets  # numpy array
+    
+    def __len__(self):
+        return len(self.sequences)
+    
+    def __getitem__(self, idx):
+        # Convert to tensor only when accessing a single sample
+        # This is much more memory-efficient than storing all tensors
+        return torch.FloatTensor(self.sequences[idx]), torch.FloatTensor(self.targets[idx])
+
+
+class LSTMPredictor(nn.Module):
+    """LSTM model for predicting SPX High and Low"""
+    def __init__(self, input_size, hidden_size=128, num_layers=2, dropout=0.2):
+        super(LSTMPredictor, self).__init__()
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+        
+        # LSTM layers
+        self.lstm = nn.LSTM(
+            input_size=input_size,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            dropout=dropout if num_layers > 1 else 0,
+            batch_first=True
+        )
+        
+        # Fully connected layers
+        self.fc1 = nn.Linear(hidden_size, 64)
+        self.relu = nn.ReLU()
+        self.dropout = nn.Dropout(dropout)
+        self.fc2 = nn.Linear(64, 32)
+        self.fc3 = nn.Linear(32, 2)  # Output: High and Low
+    
+    def forward(self, x):
+        # LSTM forward pass
+        lstm_out, _ = self.lstm(x)
+        
+        # Take the last output from the sequence
+        last_output = lstm_out[:, -1, :]
+        
+        # Fully connected layers
+        out = self.fc1(last_output)
+        out = self.relu(out)
+        out = self.dropout(out)
+        out = self.fc2(out)
+        out = self.relu(out)
+        out = self.fc3(out)
+        
+        return out
+
+
+class TransformerPredictor(nn.Module):
+    """Transformer model for predicting SPX High and Low
+    
+    Uses self-attention to maintain information from all previous timesteps,
+    allowing the model to attend to any part of the sequence when making predictions.
+    """
+    def __init__(self, input_size, d_model=128, nhead=8, num_layers=3, dim_feedforward=512, dropout=0.3, max_seq_length=100):
+        super(TransformerPredictor, self).__init__()
+        self.d_model = d_model
+        self.input_size = input_size
+        
+        # Input projection to d_model
+        self.input_projection = nn.Linear(input_size, d_model)
+        
+        # Positional encoding
+        self.pos_encoder = PositionalEncoding(d_model, dropout, max_seq_length)
+        
+        # Transformer encoder layers
+        encoder_layers = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=nhead,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+            batch_first=True
+        )
+        self.transformer_encoder = nn.TransformerEncoder(encoder_layers, num_layers=num_layers)
+        
+        # Output layers
+        self.fc1 = nn.Linear(d_model, 64)
+        self.relu = nn.ReLU()
+        self.dropout = nn.Dropout(dropout)
+        self.fc2 = nn.Linear(64, 32)
+        self.fc3 = nn.Linear(32, 2)  # Output: High and Low
+    
+    def forward(self, x):
+        # x shape: (batch_size, seq_length, input_size)
+        
+        # Project input to d_model
+        x = self.input_projection(x)  # (batch_size, seq_length, d_model)
+        
+        # Add positional encoding
+        x = self.pos_encoder(x)
+        
+        # Transformer encoder (self-attention across all timesteps)
+        # This allows the model to attend to ALL previous timesteps, not just the last one
+        transformer_out = self.transformer_encoder(x)  # (batch_size, seq_length, d_model)
+        
+        # Use the last timestep's output (which has attended to all previous timesteps)
+        last_output = transformer_out[:, -1, :]  # (batch_size, d_model)
+        
+        # Fully connected layers
+        out = self.fc1(last_output)
+        out = self.relu(out)
+        out = self.dropout(out)
+        out = self.fc2(out)
+        out = self.relu(out)
+        out = self.fc3(out)
+        
+        return out
+
+
+class PositionalEncoding(nn.Module):
+    """Positional encoding for transformer to understand sequence order"""
+    def __init__(self, d_model, dropout=0.1, max_len=200):
+        super(PositionalEncoding, self).__init__()
+        self.dropout = nn.Dropout(p=dropout)
+        
+        # Create positional encoding matrix
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-np.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(0)  # (1, max_len, d_model)
+        self.register_buffer('pe', pe)
+    
+    def forward(self, x):
+        # x shape: (batch_size, seq_length, d_model)
+        seq_len = x.size(1)
+        # Add positional encoding (pe is a registered buffer tensor, shape (1, max_len, d_model))
+        x = x + self.pe[:, :seq_len, :]  # type: ignore
+        return self.dropout(x)
+
+
+def load_data(data_dir: str) -> pd.DataFrame:
+    """Load and combine SPX, SPY, and VIX data"""
+    print("Loading data files...")
+    
+    # Get all date prefixes
+    spx_files = glob.glob(os.path.join(data_dir, "*_SPX.txt"))
+    date_prefixes = set()
+    for file in spx_files:
+        basename = os.path.basename(file)
+        date_prefix = basename.replace("_SPX.txt", "")
+        date_prefixes.add(date_prefix)
+    
+    all_data = []
+    
+    for date_prefix in sorted(date_prefixes):
+        spx_file = os.path.join(data_dir, f"{date_prefix}_SPX.txt")
+        spy_file = os.path.join(data_dir, f"{date_prefix}_SPY.txt")
+        vix_file = os.path.join(data_dir, f"{date_prefix}_VIX.txt")
+        
+        # Check if all files exist
+        if not all(os.path.exists(f) for f in [spx_file, spy_file, vix_file]):
+            continue
+        
+        try:
+            # Load data
+            spx_df = pd.read_csv(spx_file)
+            spy_df = pd.read_csv(spy_file)
+            vix_df = pd.read_csv(vix_file)
+            
+            # Merge on Date (timestamp)
+            # SPX: Remove Volume
+            merged = spx_df[['Date', 'Open', 'High', 'Low', 'Close']].merge(
+                spy_df[['Date', 'Open', 'High', 'Low', 'Close', 'Volume']],
+                on='Date',
+                suffixes=('_SPX', '_SPY')
+            )
+            # VIX: Remove Volume
+            merged = merged.merge(
+                vix_df[['Date', 'Open', 'High', 'Low', 'Close']],
+                on='Date',
+                suffixes=('', '_VIX')
+            )
+            
+            # Rename VIX columns
+            merged = merged.rename(columns={
+                'Open': 'Open_VIX',
+                'High': 'High_VIX',
+                'Low': 'Low_VIX',
+                'Close': 'Close_VIX'
+            })
+            
+            all_data.append(merged)
+        except Exception as e:
+            print(f"Error loading {date_prefix}: {e}")
+            continue
+    
+    if not all_data:
+        raise ValueError("No data files could be loaded!")
+    
+    # Concatenate all data
+    combined_df = pd.concat(all_data, ignore_index=True)
+    combined_df = combined_df.sort_values('Date').reset_index(drop=True)
+    
+    print(f"Loaded {len(combined_df)} total rows from {len(all_data)} days")
+    
+    # Add time-of-day column (time from start of trading day)
+    combined_df = add_time_of_day(combined_df)
+    gc.collect()  # Free memory after processing
+    
+    # Add technical indicators
+    combined_df = add_technical_indicators(combined_df)
+    gc.collect()  # Free memory after technical indicators
+    
+    return combined_df
+
+
+def add_time_of_day(df: pd.DataFrame) -> pd.DataFrame:
+    """Add time-of-day column representing seconds from start of trading day (9:30 AM ET)"""
+    df = df.copy()
+    
+    # Convert timestamp to datetime
+    df['DateTime'] = pd.to_datetime(df['Date'], unit='s')
+    
+    # Extract date and time components
+    df['Date_only'] = df['DateTime'].dt.date
+    df['Time'] = df['DateTime'].dt.time
+    
+    # Calculate seconds from midnight
+    df['Seconds_from_midnight'] = (
+        df['DateTime'].dt.hour * 3600 + 
+        df['DateTime'].dt.minute * 60 + 
+        df['DateTime'].dt.second
+    )
+    
+    # Trading day starts at 9:30 AM ET = 34200 seconds from midnight
+    # Trading day ends at 4:00 PM ET = 57600 seconds from midnight
+    TRADING_START_SECONDS = 34200  # 9:30 AM
+    TRADING_END_SECONDS = 57600    # 4:00 PM
+    
+    # Calculate time from start of trading day (normalized to 0-1)
+    df['Time_of_Day'] = (df['Seconds_from_midnight'] - TRADING_START_SECONDS) / (TRADING_END_SECONDS - TRADING_START_SECONDS)
+    
+    # Clip to valid trading hours (0-1 range)
+    df['Time_of_Day'] = df['Time_of_Day'].clip(0, 1)
+    
+    # Drop intermediate columns
+    df = df.drop(columns=['DateTime', 'Date_only', 'Time', 'Seconds_from_midnight'])
+    
+    return df
+
+
+def add_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    """Add technical indicators for SPX, SPY, and VIX"""
+    df = df.copy()
+    
+    # Sort by Date to ensure proper calculation
+    df = df.sort_values('Date').reset_index(drop=True)
+    
+    # For each symbol (SPX, SPY, VIX)
+    for symbol in ['SPX', 'SPY', 'VIX']:
+        close_col = f'Close_{symbol}'
+        high_col = f'High_{symbol}'
+        low_col = f'Low_{symbol}'
+        open_col = f'Open_{symbol}'
+        
+        # Moving Averages
+        df[f'MA_5_{symbol}'] = df[close_col].rolling(window=5, min_periods=1).mean()
+        df[f'MA_10_{symbol}'] = df[close_col].rolling(window=10, min_periods=1).mean()
+        df[f'MA_20_{symbol}'] = df[close_col].rolling(window=20, min_periods=1).mean()
+        
+        # Exponential Moving Averages
+        df[f'EMA_12_{symbol}'] = df[close_col].ewm(span=12, adjust=False).mean()
+        df[f'EMA_26_{symbol}'] = df[close_col].ewm(span=26, adjust=False).mean()
+        
+        # RSI (Relative Strength Index)
+        delta = df[close_col].diff()
+        gain = (delta.where(delta > 0, 0)).rolling(window=14, min_periods=1).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=14, min_periods=1).mean()
+        rs = gain / (loss + 1e-10)  # Add small epsilon to avoid division by zero
+        df[f'RSI_{symbol}'] = 100 - (100 / (1 + rs))
+        
+        # MACD
+        df[f'MACD_{symbol}'] = df[f'EMA_12_{symbol}'] - df[f'EMA_26_{symbol}']
+        df[f'MACD_Signal_{symbol}'] = df[f'MACD_{symbol}'].ewm(span=9, adjust=False).mean()
+        df[f'MACD_Hist_{symbol}'] = df[f'MACD_{symbol}'] - df[f'MACD_Signal_{symbol}']
+        
+        # Bollinger Bands
+        ma_20 = df[close_col].rolling(window=20, min_periods=1).mean()
+        std_20 = df[close_col].rolling(window=20, min_periods=1).std()
+        df[f'BB_Upper_{symbol}'] = ma_20 + (std_20 * 2)
+        df[f'BB_Lower_{symbol}'] = ma_20 - (std_20 * 2)
+        df[f'BB_Width_{symbol}'] = df[f'BB_Upper_{symbol}'] - df[f'BB_Lower_{symbol}']
+        df[f'BB_Position_{symbol}'] = (df[close_col] - df[f'BB_Lower_{symbol}']) / (df[f'BB_Width_{symbol}'] + 1e-10)
+        
+        # Stochastic Oscillator
+        low_14 = df[low_col].rolling(window=14, min_periods=1).min()
+        high_14 = df[high_col].rolling(window=14, min_periods=1).max()
+        df[f'Stoch_K_{symbol}'] = 100 * ((df[close_col] - low_14) / (high_14 - low_14 + 1e-10))
+        df[f'Stoch_D_{symbol}'] = df[f'Stoch_K_{symbol}'].rolling(window=3, min_periods=1).mean()
+        
+        # Average True Range (ATR)
+        high_low = df[high_col] - df[low_col]
+        high_close = abs(df[high_col] - df[close_col].shift(1))
+        low_close = abs(df[low_col] - df[close_col].shift(1))
+        tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+        df[f'ATR_{symbol}'] = tr.rolling(window=14, min_periods=1).mean()
+        
+        # Price Change and Returns
+        df[f'Price_Change_{symbol}'] = df[close_col].diff()
+        df[f'Price_Change_Pct_{symbol}'] = df[close_col].pct_change()
+        
+        # Volatility (rolling standard deviation of returns)
+        df[f'Volatility_{symbol}'] = df[f'Price_Change_Pct_{symbol}'].rolling(window=20, min_periods=1).std()
+        
+        # High-Low Spread
+        df[f'HL_Spread_{symbol}'] = df[high_col] - df[low_col]
+        df[f'HL_Spread_Pct_{symbol}'] = df[f'HL_Spread_{symbol}'] / (df[close_col] + 1e-10)
+    
+    # Fill NaN values with forward fill then backward fill
+    df = df.ffill().bfill()
+    
+    # Replace any remaining NaN with 0
+    df = df.fillna(0)
+    
+    return df
+
+
+def create_sequences(data: pd.DataFrame, sequence_length: int = 20) -> Tuple[np.ndarray, np.ndarray, StandardScaler, StandardScaler]:
+    """Create sequences of length sequence_length for training"""
+    print(f"Creating sequences of length {sequence_length}...")
+    
+    # Select features: SPX, SPY, and VIX OHLC data (Volume removed from SPX and VIX)
+    # Plus technical indicators and time-of-day
+    base_columns = [
+        'Open_SPX', 'High_SPX', 'Low_SPX', 'Close_SPX',
+        'Open_SPY', 'High_SPY', 'Low_SPY', 'Close_SPY', 'Volume_SPY',
+        'Open_VIX', 'High_VIX', 'Low_VIX', 'Close_VIX',
+        'Time_of_Day'
+    ]
+    
+    # Technical indicator columns
+    tech_indicators = []
+    for symbol in ['SPX', 'SPY', 'VIX']:
+        tech_indicators.extend([
+            f'MA_5_{symbol}', f'MA_10_{symbol}', f'MA_20_{symbol}',
+            f'EMA_12_{symbol}', f'EMA_26_{symbol}',
+            f'RSI_{symbol}',
+            f'MACD_{symbol}', f'MACD_Signal_{symbol}', f'MACD_Hist_{symbol}',
+            f'BB_Upper_{symbol}', f'BB_Lower_{symbol}', f'BB_Width_{symbol}', f'BB_Position_{symbol}',
+            f'Stoch_K_{symbol}', f'Stoch_D_{symbol}',
+            f'ATR_{symbol}',
+            f'Price_Change_{symbol}', f'Price_Change_Pct_{symbol}',
+            f'Volatility_{symbol}',
+            f'HL_Spread_{symbol}', f'HL_Spread_Pct_{symbol}'
+        ])
+    
+    # Combine all feature columns
+    feature_columns = base_columns + tech_indicators
+    
+    # Filter to only columns that exist in the dataframe
+    feature_columns = [col for col in feature_columns if col in data.columns]
+    
+    print(f"Using {len(feature_columns)} features for prediction")
+    
+    # Extract features and targets
+    features = data[feature_columns].values
+    targets = data[['High_SPX', 'Low_SPX']].values  # Predict SPX High and Low
+    
+    # Normalize features
+    scaler_features = StandardScaler()
+    features_scaled = scaler_features.fit_transform(features)
+    
+    # Normalize targets
+    scaler_targets = StandardScaler()
+    targets_scaled = scaler_targets.fit_transform(targets)
+    
+    # Create sequences
+    sequences = []
+    target_sequences = []
+    
+    for i in range(len(features_scaled) - sequence_length):
+        seq = features_scaled[i:i + sequence_length]
+        target = targets_scaled[i + sequence_length]
+        sequences.append(seq)
+        target_sequences.append(target)
+    
+    sequences = np.array(sequences)
+    target_sequences = np.array(target_sequences)
+    
+    print(f"Created {len(sequences)} sequences")
+    gc.collect()  # Free memory after sequence creation
+    return sequences, target_sequences, scaler_features, scaler_targets
+
+
+def train_model(model, train_loader, val_loader, device, num_epochs=50, learning_rate=0.001, early_stopping_patience=10):
+    """Train the model with gradient clipping and early stopping"""
+    criterion = nn.MSELoss()
+    optimizer = optim.Adam(model.parameters(), lr=learning_rate, weight_decay=1e-5)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5, min_lr=1e-6)
+    
+    train_losses = []
+    val_losses = []
+    best_val_loss = float('inf')
+    patience_counter = 0
+    best_epoch = 0
+    
+    print("\nStarting training...")
+    print(f"Early stopping patience: {early_stopping_patience} epochs")
+    for epoch in range(num_epochs):
+        # Training phase
+        model.train()
+        train_loss = 0.0
+        for sequences, targets in train_loader:
+            sequences = sequences.to(device)
+            targets = targets.to(device)
+            optimizer.zero_grad()
+            outputs = model(sequences)
+            loss = criterion(outputs, targets)
+            loss.backward()
+            
+            # Gradient clipping to prevent explosion
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            
+            optimizer.step()
+            train_loss += loss.item()
+        
+        train_loss /= len(train_loader)
+        train_losses.append(train_loss)
+        
+        # Validation phase
+        model.eval()
+        val_loss = 0.0
+        with torch.no_grad():
+            for sequences, targets in val_loader:
+                sequences = sequences.to(device)
+                targets = targets.to(device)
+                outputs = model(sequences)
+                loss = criterion(outputs, targets)
+                val_loss += loss.item()
+        
+        val_loss /= len(val_loader)
+        val_losses.append(val_loss)
+        
+        scheduler.step(val_loss)
+        
+        # Save best model
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            best_epoch = epoch + 1
+            patience_counter = 0
+            torch.save(model.state_dict(), 'best_model.pth')
+        else:
+            patience_counter += 1
+        
+        # Early stopping
+        if patience_counter >= early_stopping_patience:
+            print(f"\nEarly stopping triggered at epoch {epoch + 1}")
+            print(f"Best validation loss: {best_val_loss:.6f} at epoch {best_epoch}")
+            break
+        
+        if (epoch + 1) % 10 == 0:
+            current_lr = optimizer.param_groups[0]['lr']
+            print(f"Epoch [{epoch+1}/{num_epochs}], Train Loss: {train_loss:.6f}, Val Loss: {val_loss:.6f}, LR: {current_lr:.2e}, Patience: {patience_counter}/{early_stopping_patience}")
+            gc.collect()  # Periodic garbage collection during training
+    
+    # Load best model
+    model.load_state_dict(torch.load('best_model.pth'))
+    gc.collect()  # Free memory after training
+    print(f"\nTraining completed. Best validation loss: {best_val_loss:.6f} at epoch {best_epoch}")
+    
+    return train_losses, val_losses
+
+
+def evaluate_model(model, test_loader, scaler_targets, device):
+    """Evaluate the model and calculate performance metrics"""
+    model.eval()
+    all_predictions = []
+    all_targets = []
+    
+    with torch.no_grad():
+        for sequences, targets in test_loader:
+            sequences = sequences.to(device)
+            targets = targets.to(device)
+            outputs = model(sequences)
+            all_predictions.append(outputs.cpu().numpy())
+            all_targets.append(targets.cpu().numpy())
+    
+    # Concatenate all predictions and targets
+    predictions = np.concatenate(all_predictions, axis=0)
+    targets = np.concatenate(all_targets, axis=0)
+    
+    # Clear intermediate lists to free memory
+    del all_predictions, all_targets
+    gc.collect()
+    
+    # Inverse transform to get actual values
+    predictions_actual = scaler_targets.inverse_transform(predictions)
+    targets_actual = scaler_targets.inverse_transform(targets)
+    
+    # Calculate metrics
+    from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+    
+    # Metrics for High
+    mse_high = mean_squared_error(targets_actual[:, 0], predictions_actual[:, 0])
+    mae_high = mean_absolute_error(targets_actual[:, 0], predictions_actual[:, 0])
+    rmse_high = np.sqrt(mse_high)
+    r2_high = r2_score(targets_actual[:, 0], predictions_actual[:, 0])
+    
+    # Metrics for Low
+    mse_low = mean_squared_error(targets_actual[:, 1], predictions_actual[:, 1])
+    mae_low = mean_absolute_error(targets_actual[:, 1], predictions_actual[:, 1])
+    rmse_low = np.sqrt(mse_low)
+    r2_low = r2_score(targets_actual[:, 1], predictions_actual[:, 1])
+    
+    # Overall metrics
+    mse_overall = mean_squared_error(targets_actual, predictions_actual)
+    mae_overall = mean_absolute_error(targets_actual, predictions_actual)
+    rmse_overall = np.sqrt(mse_overall)
+    
+    return {
+        'high': {
+            'mse': mse_high,
+            'mae': mae_high,
+            'rmse': rmse_high,
+            'r2': r2_high
+        },
+        'low': {
+            'mse': mse_low,
+            'mae': mae_low,
+            'rmse': rmse_low,
+            'r2': r2_low
+        },
+        'overall': {
+            'mse': mse_overall,
+            'mae': mae_overall,
+            'rmse': rmse_overall
+        },
+        'predictions': predictions_actual,
+        'targets': targets_actual
+    }
+
+
+def main():
+    # Configuration
+    DATA_DIR = 'daily_data'
+    SEQUENCE_LENGTH = 100
+    BATCH_SIZE = 32
+    NUM_EPOCHS = 50
+    LEARNING_RATE = 0.0005  # Reduced from 0.001 to prevent instability
+    EARLY_STOPPING_PATIENCE = 10  # Stop if validation loss doesn't improve for 10 epochs
+    
+    # Model selection: 'lstm' or 'transformer'
+    MODEL_TYPE = 'transformer'  # Change to 'lstm' to use LSTM model
+    
+    # LSTM-specific parameters
+    HIDDEN_SIZE = 128
+    NUM_LAYERS = 2
+    
+    # Transformer-specific parameters
+    D_MODEL = 128  # Model dimension
+    NHEAD = 8  # Number of attention heads
+    TRANSFORMER_LAYERS = 3  # Number of transformer encoder layers
+    DIM_FEEDFORWARD = 512  # Feedforward network dimension
+    
+    # Check if CUDA is available
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}")
+    
+    # Load data
+    data = load_data(DATA_DIR)
+    gc.collect()  # Free memory after data loading
+    
+    # Create sequences
+    sequences, targets, scaler_features, scaler_targets = create_sequences(data, SEQUENCE_LENGTH)
+    del data  # Free the original dataframe
+    gc.collect()  # Free memory after sequence creation
+    
+    # Split data: 70% train, 15% validation, 15% test
+    X_train, X_temp, y_train, y_temp = train_test_split(
+        sequences, targets, test_size=0.3, shuffle=False
+    )
+    X_val, X_test, y_val, y_test = train_test_split(
+        X_temp, y_temp, test_size=0.5, shuffle=False
+    )
+    
+    # Free intermediate split data
+    del X_temp, y_temp
+    gc.collect()  # Free memory after data splitting
+    
+    print(f"\nData split:")
+    print(f"  Training: {len(X_train)} samples")
+    print(f"  Validation: {len(X_val)} samples")
+    print(f"  Test: {len(X_test)} samples")
+    
+    # Create data loaders
+    train_dataset = StockDataset(X_train, y_train)
+    val_dataset = StockDataset(X_val, y_val)
+    test_dataset = StockDataset(X_test, y_test)
+    
+    # For time series, we should NOT shuffle to maintain temporal order
+    # Shuffling can break temporal dependencies and cause the model to learn
+    # patterns that don't respect the chronological sequence
+    # Memory optimizations: num_workers=0 (no multiprocessing), pin_memory=False (saves RAM)
+    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=0, pin_memory=False)
+    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=0, pin_memory=False)
+    test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=0, pin_memory=False)
+    
+    # Create model
+    input_size = sequences.shape[2]  # Number of features
+    
+    if MODEL_TYPE.lower() == 'transformer':
+        model = TransformerPredictor(
+            input_size=input_size,
+            d_model=D_MODEL,
+            nhead=NHEAD,
+            num_layers=TRANSFORMER_LAYERS,
+            dim_feedforward=DIM_FEEDFORWARD,
+            dropout=0.3,  # Increased dropout to prevent overfitting
+            max_seq_length=SEQUENCE_LENGTH
+        ).to(device)
+        
+        print(f"\nModel architecture: Transformer")
+        print(f"  Input size: {input_size}")
+        print(f"  Model dimension (d_model): {D_MODEL}")
+        print(f"  Attention heads: {NHEAD}")
+        print(f"  Transformer layers: {TRANSFORMER_LAYERS}")
+        print(f"  Feedforward dimension: {DIM_FEEDFORWARD}")
+        print(f"  Sequence length: {SEQUENCE_LENGTH}")
+        print(f"  Total parameters: {sum(p.numel() for p in model.parameters()):,}")
+        print(f"\n  Note: Transformer uses self-attention to maintain information")
+        print(f"  from ALL {SEQUENCE_LENGTH} previous timesteps simultaneously.")
+    else:
+        model = LSTMPredictor(
+            input_size=input_size,
+            hidden_size=HIDDEN_SIZE,
+            num_layers=NUM_LAYERS,
+            dropout=0.2
+        ).to(device)
+        
+        print(f"\nModel architecture: LSTM")
+        print(f"  Input size: {input_size}")
+        print(f"  Hidden size: {HIDDEN_SIZE}")
+        print(f"  Number of layers: {NUM_LAYERS}")
+        print(f"  Total parameters: {sum(p.numel() for p in model.parameters()):,}")
+    
+    # Move data loaders to device (we'll handle this in the training loop)
+    # For now, we'll keep data on CPU and move to device in batches
+    
+    # Train model
+    train_losses, val_losses = train_model(
+        model, train_loader, val_loader, device,
+        num_epochs=NUM_EPOCHS, 
+        learning_rate=LEARNING_RATE,
+        early_stopping_patience=EARLY_STOPPING_PATIENCE
+    )
+    
+    # Evaluate model
+    print("\n" + "="*60)
+    print("EVALUATION RESULTS")
+    print("="*60)
+    
+    results = evaluate_model(model, test_loader, scaler_targets, device)
+    
+    print("\nSPX High Prediction Metrics:")
+    print(f"  MSE:  {results['high']['mse']:.4f}")
+    print(f"  MAE:  {results['high']['mae']:.4f}")
+    print(f"  RMSE: {results['high']['rmse']:.4f}")
+    print(f"  R²:   {results['high']['r2']:.4f}")
+    
+    print("\nSPX Low Prediction Metrics:")
+    print(f"  MSE:  {results['low']['mse']:.4f}")
+    print(f"  MAE:  {results['low']['mae']:.4f}")
+    print(f"  RMSE: {results['low']['rmse']:.4f}")
+    print(f"  R²:   {results['low']['r2']:.4f}")
+    
+    print("\nOverall Metrics:")
+    print(f"  MSE:  {results['overall']['mse']:.4f}")
+    print(f"  MAE:  {results['overall']['mae']:.4f}")
+    print(f"  RMSE: {results['overall']['rmse']:.4f}")
+    
+    # Calculate percentage errors
+    high_mape = np.mean(np.abs((results['targets'][:, 0] - results['predictions'][:, 0]) / results['targets'][:, 0])) * 100
+    low_mape = np.mean(np.abs((results['targets'][:, 1] - results['predictions'][:, 1]) / results['targets'][:, 1])) * 100
+    
+    print("\nMean Absolute Percentage Error (MAPE):")
+    print(f"  High: {high_mape:.2f}%")
+    print(f"  Low:  {low_mape:.2f}%")
+    
+    # Sample predictions
+    print("\n" + "="*60)
+    print("SAMPLE PREDICTIONS (First 10 test samples)")
+    print("="*60)
+    print(f"{'Index':<8} {'Actual High':<15} {'Predicted High':<15} {'Error':<12} {'Actual Low':<15} {'Predicted Low':<15} {'Error':<12}")
+    print("-" * 100)
+    for i in range(min(10, len(results['predictions']))):
+        high_actual = results['targets'][i, 0]
+        high_pred = results['predictions'][i, 0]
+        high_error = high_actual - high_pred
+        low_actual = results['targets'][i, 1]
+        low_pred = results['predictions'][i, 1]
+        low_error = low_actual - low_pred
+        print(f"{i:<8} {high_actual:<15.2f} {high_pred:<15.2f} {high_error:<12.2f} {low_actual:<15.2f} {low_pred:<15.2f} {low_error:<12.2f}")
+    
+    print("\n" + "="*60)
+    print("Model training and evaluation completed!")
+    print("="*60)
+
+
+if __name__ == "__main__":
+    main()
+
