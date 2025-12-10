@@ -39,7 +39,8 @@ def main(
     learning_rate: float = 1e-3,
     test_size: float = 0.2,
     random_state: int = 42,
-    save_model_path: Optional[str] = None
+    save_model_path: Optional[str] = None,
+    golden_test: bool = False
 ):
     """
     Main function to train SpaceTimeFormer model.
@@ -60,6 +61,7 @@ def main(
         test_size: Proportion of data for testing
         random_state: Random seed
         save_model_path: Path to save trained model (optional)
+        golden_test: If True, run in golden test mode (minimal data)
     """
     print("=" * 80)
     print("SpaceTimeFormer Training Pipeline")
@@ -71,7 +73,9 @@ def main(
     X_train, X_test, scaler, feature_names = load_data(
         data_path=data_path,
         test_size=test_size,
-        random_state=random_state
+        random_state=random_state,
+        golden_test=golden_test,
+        batch_size=batch_size
     )
     
     n_features = X_train.shape[1]
@@ -223,7 +227,8 @@ def main(
         device=torch.device('cuda' if torch.cuda.is_available() else 'cpu'),
         patience=15,
         save_path=save_model_path,
-        target_indices=target_indices
+        target_indices=target_indices,
+        scaler=scaler  # Pass scaler to save in checkpoint
     )
     
     print("\n" + "=" * 80)

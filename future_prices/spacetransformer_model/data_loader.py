@@ -7,24 +7,32 @@ import pandas as pd
 import numpy as np
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import train_test_split
-from typing import Tuple, List
+from typing import Tuple, List, Optional
+
+from .utils import extract_cyclical_time_features
 
 
 def load_data(data_path: str,
               test_size: float = 0.2, random_state: int = 42,
-              golden_test: bool = False, batch_size: int = 256) -> Tuple:
+              golden_test: bool = False, batch_size: int = 256,
+              max_rows: Optional[int] = None,
+              skip_split: bool = False,
+              skip_scaling: bool = False) -> Tuple:
     """
-    Load and prepare data for training
+    Load and prepare data for training or inference
     
     Args:
         data_path: Path to CSV file with features
-        test_size: Proportion of data for testing
+        test_size: Proportion of data for testing (ignored if skip_split=True)
         random_state: Random seed
         golden_test: If True, only read minimal data needed for testing (batch_size + small validation)
         batch_size: Batch size for golden test mode (only used if golden_test=True)
+        max_rows: Maximum number of rows to read from CSV (None = read all)
+        skip_split: If True, return full dataset without train/test split (for inference)
     
     Returns:
         (X_train, X_test, scaler, feature_names)
+        If skip_split=True, returns (X_full, X_full, scaler, feature_names) where X_full is the full dataset
     """
     print(f"Loading data from {data_path}...")
     
@@ -32,16 +40,19 @@ def load_data(data_path: str,
     
     # For golden test, only read the rows we need
     if golden_test:
-        # Read only: batch_size for training + small validation set (e.g., 10% of batch_size)
-        # Add some buffer for test set
-        val_samples = max(1, batch_size // 10)
-        test_samples = max(1, batch_size // 10)
-        nrows_to_read = batch_size + val_samples + test_samples
+        # Read batch_size * 2 rows as requested
+        nrows_to_read = 128
         print(f"GOLDEN TEST MODE: Reading only first {nrows_to_read} rows from CSV")
         df = pd.read_csv(data_path, nrows=nrows_to_read)
+    elif max_rows is not None:
+        print(f"Reading only first {max_rows} rows from CSV")
+        df = pd.read_csv(data_path, nrows=max_rows)
     else:
         df = pd.read_csv(data_path)
     
+    # Extract cyclical time features from datetime columns
+    df = extract_cyclical_time_features(df)
+
     # Select feature columns
     # Forward-looking columns contain future information
     forward_looking_cols = ['PctChange_ToMaxHigh_5', 'PctChange_ToMinLow_5']
@@ -69,17 +80,33 @@ def load_data(data_path: str,
     else:
         print("No NaN values found in features")
     
-    # Split data (features only)
-    X_train, X_test = train_test_split(
-        X, test_size=test_size, random_state=random_state, shuffle=False
-    )
-    
-    # Scale features
-    scaler = StandardScaler()
-    X_train = scaler.fit_transform(X_train)
-    X_test = scaler.transform(X_test)
-    
-    print(f"Training samples: {len(X_train)}, Test samples: {len(X_test)}")
-    
-    return X_train, X_test, scaler, feature_cols
+    # Split data (features only) or use full dataset
+    if skip_split:
+        # Return full dataset without splitting (for inference/plotting)
+        X_full = X
+        if skip_scaling:
+            # Return raw data without scaling (caller will scale with their own scaler)
+            scaler = None
+            print(f"Loaded {len(X_full)} samples (no split, no scaling)")
+        else:
+            # Scale features on full dataset
+            scaler = StandardScaler()
+            X_full = scaler.fit_transform(X_full)
+            print(f"Loaded {len(X_full)} samples (no split)")
+        # Return same data for both X_train and X_test to maintain return signature
+        return X_full, X_full, scaler, feature_cols
+    else:
+        # Split data for training
+        X_train, X_test = train_test_split(
+            X, test_size=test_size, random_state=random_state, shuffle=False
+        )
+        
+        # Scale features
+        scaler = StandardScaler()
+        X_train = scaler.fit_transform(X_train)
+        X_test = scaler.transform(X_test)
+        
+        print(f"Training samples: {len(X_train)}, Test samples: {len(X_test)}")
+        
+        return X_train, X_test, scaler, feature_cols
 

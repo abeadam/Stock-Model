@@ -56,8 +56,9 @@ class SpatiotemporalEmbedding(nn.Module):
         Create spatiotemporal embeddings from input data.
         
         Args:
-            x: Input tensor of shape (batch_size, seq_length, n_variables)
-               Each element is a feature value
+            x: Input tensor of shape (batch_size, seq_length, n_features)
+               Each element is a feature value. If n_features > self.n_variables, 
+               only the first self.n_variables will be used.
             variable_ids: Optional tensor of shape (batch_size, seq_length, n_variables)
                          with variable indices. If None, uses sequential indices.
         
@@ -65,7 +66,21 @@ class SpatiotemporalEmbedding(nn.Module):
             Embedded tensor of shape (batch_size, seq_length * n_variables, d_model)
             The sequence is flattened: [var0_t0, var1_t0, ..., varN_t0, var0_t1, ...]
         """
-        batch_size, seq_length, n_variables = x.shape
+        batch_size, seq_length, n_features = x.shape
+        
+        # CRITICAL: Use self.n_variables (model's expected number) instead of input shape
+        # Slice input if it has more features than expected (e.g., extra cyclical features)
+        if n_features > self.n_variables:
+            x = x[:, :, :self.n_variables]
+            n_features = self.n_variables
+        elif n_features < self.n_variables:
+            raise ValueError(
+                f"Input has {n_features} features but model expects {self.n_variables}. "
+                "Cannot proceed with fewer features."
+            )
+        
+        # Now n_features == self.n_variables, use self.n_variables for consistency
+        n_variables = self.n_variables
         
         # Flatten to create tokens: each token is one variable at one timestep
         # Shape: (batch_size, seq_length * n_variables, 1)
@@ -149,7 +164,6 @@ class TemporalPositionalEncoding(nn.Module):
         Returns:
             Positional encodings of shape (batch_size, seq_length, d_model)
         """
-        batch_size, seq_length = positions.shape
         
         # Get encodings for each position
         # positions: (batch_size, seq_length) -> (batch_size, seq_length, d_model)

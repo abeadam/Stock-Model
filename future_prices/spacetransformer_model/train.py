@@ -6,11 +6,14 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
-from typing import Tuple, Optional, List
+from typing import Tuple, Optional, List, TYPE_CHECKING
 import numpy as np
 import gc
 import time
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+
+if TYPE_CHECKING:
+    from .model import SpaceTimeFormer
 
 
 class TimeSeriesDataset(Dataset):
@@ -178,6 +181,8 @@ def validate(
             batch_size = batch_X.shape[0]
             target_length = batch_target_X.shape[1]
             
+            encoder_output = model.encode(batch_X) # type: ignore
+            
             # Initial input: Last context step
             # Shape: (batch_size, 1, n_features)
             current_input = batch_X[:, -1:, :]
@@ -186,9 +191,14 @@ def validate(
             predictions_list = []
             
             for t in range(target_length):
-                # Predict next step using accumulated sequence
-                # Note: Re-running full forward pass is inefficient but correct for this architecture
-                step_predictions = model(batch_X, current_input)
+                # Predict next step using accumulated sequence and cached encoder output
+                # Note: We still re-process the decoder sequence, but avoid re-encoding context
+                
+                # Check memory before forward pass
+                # if device.type == 'cuda':
+                #      torch.cuda.empty_cache()
+
+                step_predictions = model.decode(current_input, encoder_output) # type: ignore
                 
                 # Get the prediction for the last step
                 # Shape: (batch_size, 1, n_features)
@@ -268,7 +278,8 @@ def train_model(
     device: Optional[torch.device] = None,
     patience: int = 10,
     save_path: Optional[str] = None,
-    target_indices: Optional[list[int]] = None
+    target_indices: Optional[list[int]] = None,
+    scaler: Optional[object] = None
 ) -> dict:
     """
     Train SpaceTimeFormer model.
@@ -407,14 +418,81 @@ def train_model(
             
             # Save best model
             if save_path:
-                torch.save({
+                # Extract architecture parameters from model
+                try:
+                    # Get n_heads from first encoder layer
+                    encoder_layer = list(model.encoder)[0]  # type: ignore
+                    if hasattr(encoder_layer.attention, 'n_heads'):
+                        n_heads = encoder_layer.attention.n_heads
+                    elif hasattr(encoder_layer.attention, 'attention') and hasattr(encoder_layer.attention.attention, 'n_heads'):
+                        n_heads = encoder_layer.attention.attention.n_heads
+                    else:
+                        n_heads = 4  # Default fallback
+                    
+                    # Get d_ff from first encoder layer's feed-forward network
+                    if hasattr(encoder_layer, 'ff') and len(encoder_layer.ff) > 0:
+                        d_ff = encoder_layer.ff[0].out_features  # type: ignore
+                    else:
+                        d_ff = 256
+                    
+                    # Get use_windowed_attn and window_size
+                    use_windowed_attn = hasattr(encoder_layer.attention, 'window_size')
+                    window_size = encoder_layer.attention.window_size if use_windowed_attn else 50  # type: ignore
+                    
+                    # Get dropout
+                    dropout = encoder_layer.dropout.p if hasattr(encoder_layer, 'dropout') else 0.1  # type: ignore
+                    
+                    # Get max_seq_length from embedding
+                    max_seq_length = model.embedding.max_seq_length if hasattr(model.embedding, 'max_seq_length') else 1000  # type: ignore
+                    
+                    # Get layer counts
+                    enc_layers = len(list(model.encoder))  # type: ignore
+                    dec_layers = len(list(model.decoder))  # type: ignore
+                    
+                except Exception as e:
+                    print(f"  -> Warning: Could not extract all architecture parameters: {e}")
+                    # Use defaults
+                    n_heads = 4
+                    d_ff = 256
+                    use_windowed_attn = True
+                    window_size = 200
+                    dropout = 0.1
+                    max_seq_length = 1000
+                    enc_layers = 3
+                    dec_layers = 3
+                
+                checkpoint_data = {
                     'epoch': epoch,
                     'model_state_dict': model.state_dict(),
                     'optimizer_state_dict': optimizer.state_dict(),
                     'val_loss': val_loss,
                     'val_metrics': val_metrics,
-                    'history': history
-                }, save_path)
+                    'history': history,
+                    # Architecture parameters
+                    'n_variables': model.n_variables,
+                    'd_model': model.d_model,
+                    'n_heads': n_heads,
+                    'enc_layers': enc_layers,
+                    'dec_layers': dec_layers,
+                    'd_ff': d_ff,
+                    'dropout': dropout,
+                    'max_seq_length': max_seq_length,
+                    'context_points': model.context_points,
+                    'target_points': model.target_points,
+                    'use_windowed_attn': use_windowed_attn,
+                    'window_size': window_size
+                }
+                
+                # Save scaler if provided
+                if scaler is not None:
+                    import pickle
+                    import io
+                    scaler_bytes = io.BytesIO()
+                    pickle.dump(scaler, scaler_bytes)
+                    scaler_bytes.seek(0)
+                    checkpoint_data['scaler'] = scaler_bytes.getvalue()
+                
+                torch.save(checkpoint_data, save_path)
                 print(f"  → Saved best model to: {save_path}")
         else:
             patience_counter += 1

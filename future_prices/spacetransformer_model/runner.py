@@ -32,6 +32,7 @@ if __name__ == '__main__':
         batch_size=2,  # Further reduced batch size to avoid OOM
         d_model=64,    # Reduce model dimension to save memory
         d_ff=256,      # Reduce feed-forward dimension
-        n_heads=4      # Reduce number of heads to save memory
+        n_heads=4,     # Reduce number of heads to save memory
+        golden_test=True # Run fast golden test with minimal data
     )
 

@@ -96,7 +96,9 @@ class SpaceTimeFormer(nn.Module):
                 d_ff=d_ff,
                 dropout=dropout,
                 use_windowed=use_windowed_attn,
-                window_size=window_size
+                window_size=window_size,
+                is_decoder=True,
+                is_causal=True  # Decoder must be causal (mask future)
             )
             for _ in range(dec_layers)
         ])
@@ -118,6 +120,67 @@ class SpaceTimeFormer(nn.Module):
             elif isinstance(module, nn.Embedding):
                 nn.init.normal_(module.weight, mean=0, std=0.02)
     
+    def encode(self, x_context: torch.Tensor) -> torch.Tensor:
+        """
+        Encode the context sequence.
+        
+        Args:
+            x_context: Context sequence (batch_size, context_points, n_variables)
+            
+        Returns:
+            Encoded context representation
+        """
+        # Embed context sequence
+        # Shape: (batch_size, context_points * n_variables, d_model)
+        context_emb = self.embedding(x_context)
+        
+        # Pass through encoder layers
+        encoder_output = context_emb
+        for layer in self.encoder:
+            encoder_output = layer(encoder_output)
+            # if encoder_output.device.type == 'cuda':
+            #     torch.cuda.empty_cache()
+            #     torch.cuda.synchronize()
+                # gc.collect() # Skip gc.collect inside loop for speed
+                
+        return encoder_output
+
+    def decode(self, x_target: torch.Tensor, encoder_output: torch.Tensor) -> torch.Tensor:
+        """
+        Decode the target sequence using the encoded context.
+        
+        Args:
+            x_target: Target sequence so far (batch_size, current_seq_len, n_variables)
+            encoder_output: Output from the encoder
+            
+        Returns:
+            Predictions (batch_size, current_seq_len, n_variables)
+        """
+        batch_size = x_target.shape[0]
+        
+        # Embed target sequence
+        target_emb = self.embedding(x_target)
+        
+        # Decoder processes target sequence
+        decoder_output = target_emb
+        for layer in self.decoder:
+            decoder_output = layer(decoder_output, encoder_output=encoder_output)
+            
+        # Determine actual sequence length processed in decoder
+        current_seq_len = decoder_output.shape[1] // self.n_variables
+        
+        decoder_reshaped = decoder_output.reshape(
+            batch_size, current_seq_len, self.n_variables, self.d_model
+        )
+        
+        # Project to output
+        predictions = self.output_projection(decoder_reshaped)
+        
+        # Squeeze the last dimension
+        predictions = predictions.squeeze(-1)
+        
+        return predictions
+
     def forward(
         self,
         x_context: torch.Tensor,
@@ -133,79 +196,43 @@ class SpaceTimeFormer(nn.Module):
                      (batch_size, target_points, n_variables)
         
         Returns:
-            Predictions (batch_size, target_points, 1)
-            For PctChange_ToMaxHigh_5, we predict a single value per timestep
+            Predictions (batch_size, target_points, n_variables)
         """
-        batch_size = x_context.shape[0]
-        
-        # Embed context sequence
-        # Shape: (batch_size, context_points * n_variables, d_model)
-        context_emb = self.embedding(x_context)
-        
-        # Pass through encoder layers
-        encoder_output = context_emb
-        for layer in self.encoder:
-            encoder_output = layer(encoder_output)
-            if encoder_output.device.type == 'cuda':
-                torch.cuda.empty_cache()
-                torch.cuda.synchronize()
-                gc.collect()
-        
-        # For prediction, we need to generate target sequence
-        # Strategy: Use the last timestep's representation to initialize decoder
-        # and generate predictions autoregressively or in parallel
+        # Encode context
+        encoder_output = self.encode(x_context)
         
         if x_target is not None:
             # Training mode: use target sequence with teacher forcing
-            # Embed target sequence
-            target_emb = self.embedding(x_target)
-            
-            # Decoder processes target sequence (with masking for autoregressive prediction)
-            decoder_output = target_emb
-            for layer in self.decoder:
-                decoder_output = layer(decoder_output)
+            predictions = self.decode(x_target, encoder_output)
         else:
-            # Inference mode: generate predictions
+            # Inference mode (default one-shot): 
+            # Note: For autoregressive inference, call encode() and decode() manually in a loop
+            
             # Use encoder output to initialize decoder
             # For simplicity, we'll use the last context representation
-            # In a full implementation, this would be more sophisticated
-            
-            # Take the last timestep's representation for each variable
             # Reshape encoder output back to (batch_size, context_points, n_variables, d_model)
-            context_len = self.context_points * self.n_variables
             encoder_reshaped = encoder_output[:, -self.n_variables:, :]  # Last variables
             
-            # Repeat for target length (simple approach - can be improved)
+            # Repeat for target length
             decoder_input = encoder_reshaped.unsqueeze(1).expand(-1, self.target_points, -1, -1)
-            decoder_input = decoder_input.reshape(batch_size, self.target_points * self.n_variables, self.d_model)
+            # Reshape to match decoder input format (batch, seq_len, vars) -> actually we need (batch, seq*vars, d_model)
+            # But wait, decode() expects x_target (raw values), not embeddings.
+            # So we can't use decode() here directly with embeddings.
             
-            # Pass through decoder
-            decoder_output = decoder_input
+            # Revert to manual decoding for this specific one-shot case logic
+            # This path is legacy/fallback if x_target is None and we aren't doing AR loop
+            batch_size = x_context.shape[0]
+            decoder_input_emb = decoder_input.reshape(batch_size, self.target_points * self.n_variables, self.d_model)
+            
+            decoder_output = decoder_input_emb
             for layer in self.decoder:
-                decoder_output = layer(decoder_output)
-        
-        # Project to output dimension
-        # We only need predictions for the target variable (PctChange_ToMaxHigh_5)
-        # For simplicity, we'll take the first variable's representation
-        # In practice, you might want to learn which variable corresponds to the target
-        
-        # Reshape decoder output: (batch_size, target_points * n_variables, d_model)
-        # -> (batch_size, target_points, n_variables, d_model)
-        # Determine actual sequence length processed in decoder
-        # decoder_output shape: (batch_size, seq_len * n_variables, d_model)
-        current_seq_len = decoder_output.shape[1] // self.n_variables
-        
-        decoder_reshaped = decoder_output.reshape(
-            batch_size, current_seq_len, self.n_variables, self.d_model
-        )
-        
-        # Project to output
-        # Shape: (batch_size, seq_len, n_variables, 1)
-        predictions = self.output_projection(decoder_reshaped)
-        
-        # Squeeze the last dimension
-        # Shape: (batch_size, seq_len, n_variables)
-        predictions = predictions.squeeze(-1)
+                decoder_output = layer(decoder_output, encoder_output=encoder_output)
+            
+            current_seq_len = decoder_output.shape[1] // self.n_variables
+            decoder_reshaped = decoder_output.reshape(
+                batch_size, current_seq_len, self.n_variables, self.d_model
+            )
+            predictions = self.output_projection(decoder_reshaped).squeeze(-1)
         
         return predictions
     

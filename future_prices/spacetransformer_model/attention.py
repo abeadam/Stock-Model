@@ -65,12 +65,14 @@ class MultiHeadSpatiotemporalAttention(nn.Module):
             Output tensor (batch_size, seq_len, d_model)
         """
         batch_size, seq_len, _ = query.shape
+        k_len = key.shape[1]
+        v_len = value.shape[1]
         
         # Project to Q, K, V and split into heads
         # Shape: (batch_size, seq_len, n_heads, d_k)
         Q = self.w_q(query).view(batch_size, seq_len, self.n_heads, self.d_k).transpose(1, 2)
-        K = self.w_k(key).view(batch_size, seq_len, self.n_heads, self.d_k).transpose(1, 2)
-        V = self.w_v(value).view(batch_size, seq_len, self.n_heads, self.d_k).transpose(1, 2)
+        K = self.w_k(key).view(batch_size, k_len, self.n_heads, self.d_k).transpose(1, 2)
+        V = self.w_v(value).view(batch_size, v_len, self.n_heads, self.d_k).transpose(1, 2)
         
         # Compute attention scores
         # Shape: (batch_size, n_heads, seq_len, seq_len)
@@ -205,13 +207,14 @@ class WindowedAttention(nn.Module):
     Uses chunked attention to avoid creating large mask matrices.
     """
     
-    def __init__(self, d_model: int, n_heads: int, window_size: int, dropout: float = 0.1):
+    def __init__(self, d_model: int, n_heads: int, window_size: int, dropout: float = 0.1, is_causal: bool = False):
         """
         Args:
             d_model: Model dimension
             n_heads: Number of attention heads
             window_size: Size of attention window (number of tokens to attend to)
             dropout: Dropout probability
+            is_causal: If True, only attend to past tokens (no future peeking)
         """
         super().__init__()
         self.window_size = window_size
@@ -219,6 +222,7 @@ class WindowedAttention(nn.Module):
         self.n_heads = n_heads
         self.d_k = d_model // n_heads
         self.scale = (d_model // n_heads) ** -0.5
+        self.is_causal = is_causal
         
         # Linear projections for Q, K, V
         self.w_q = nn.Linear(d_model, d_model)
@@ -256,7 +260,13 @@ class WindowedAttention(nn.Module):
             
             # Define window boundaries for this position
             start = max(0, global_i - half_window)
-            end = min(seq_len, global_i + half_window + 1)
+            if self.is_causal:
+                # Causal attention: Can only attend up to current position (inclusive)
+                # Looking at future (global_i + 1 to global_i + half_window) is forbidden
+                end = min(seq_len, global_i + 1)
+            else:
+                # Bidirectional attention: Can look at future within window
+                end = min(seq_len, global_i + half_window + 1)
             
             # Extract Q for current position (relative to chunk)
             q_i = Q_chunk[:, :, i:i+1, :].contiguous()
@@ -319,6 +329,8 @@ class WindowedAttention(nn.Module):
             value = query
         
         batch_size, seq_len, d_model = query.shape
+        k_len = key.shape[1]
+        v_len = value.shape[1]
         
         # Project to Q, K, V
         Q = self.w_q(query)  # (batch_size, seq_len, d_model)
@@ -327,8 +339,8 @@ class WindowedAttention(nn.Module):
         
         # Reshape for multi-head attention
         Q = Q.view(batch_size, seq_len, self.n_heads, self.d_k).transpose(1, 2)
-        K = K.view(batch_size, seq_len, self.n_heads, self.d_k).transpose(1, 2)
-        V = V.view(batch_size, seq_len, self.n_heads, self.d_k).transpose(1, 2)
+        K = K.view(batch_size, k_len, self.n_heads, self.d_k).transpose(1, 2)
+        V = V.view(batch_size, v_len, self.n_heads, self.d_k).transpose(1, 2)
         
         # Clear original Q, K, V projections inputs to free memory
         del query, key, value
@@ -375,7 +387,8 @@ class SpatiotemporalTransformerBlock(nn.Module):
     
     def __init__(self, d_model: int, n_heads: int, d_ff: int, 
                  dropout: float = 0.1, use_windowed: bool = False, 
-                 window_size: Optional[int] = None):
+                 window_size: Optional[int] = None, is_decoder: bool = False,
+                 is_causal: bool = False):
         """
         Args:
             d_model: Model dimension
@@ -384,14 +397,28 @@ class SpatiotemporalTransformerBlock(nn.Module):
             dropout: Dropout probability
             use_windowed: If True, use windowed attention instead of full attention
             window_size: Window size for windowed attention (if use_windowed=True)
+            is_decoder: Whether this block is used in the decoder (adds cross-attention)
+            is_causal: Whether self-attention should be causal (mask future)
         """
         super().__init__()
+        self.is_decoder = is_decoder
+        self.is_causal = is_causal
+        self.use_windowed = use_windowed
         
-        # Attention mechanism
+        # Self-attention mechanism
         if use_windowed and window_size is not None:
-            self.attention = WindowedAttention(d_model, n_heads, window_size, dropout)
+            self.attention = WindowedAttention(d_model, n_heads, window_size, dropout, is_causal=is_causal)
         else:
             self.attention = MultiHeadSpatiotemporalAttention(d_model, n_heads, dropout)
+            
+        # Cross-attention mechanism (only for decoder)
+        # Cross-attention is generally NOT causal (attends to full encoder history)
+        if is_decoder:
+            if use_windowed and window_size is not None:
+                self.cross_attention = WindowedAttention(d_model, n_heads, window_size, dropout, is_causal=False)
+            else:
+                self.cross_attention = MultiHeadSpatiotemporalAttention(d_model, n_heads, dropout)
+            self.norm3 = nn.LayerNorm(d_model)
         
         # Feed-forward network
         self.ff = nn.Sequential(
@@ -409,20 +436,41 @@ class SpatiotemporalTransformerBlock(nn.Module):
         # Dropout
         self.dropout = nn.Dropout(dropout)
     
-    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None, 
+                encoder_output: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         Forward pass through transformer block.
         
         Args:
             x: Input tensor (batch_size, seq_len, d_model)
             mask: Optional attention mask
+            encoder_output: Output from encoder (required if is_decoder=True)
         
         Returns:
             Output tensor (batch_size, seq_len, d_model)
         """
+        # Generate causal mask if needed and not provided (for non-windowed attention)
+        if self.is_causal and mask is None and not self.use_windowed:
+            seq_len = x.shape[1]
+            # Create upper triangular mask with -inf
+            mask = torch.triu(torch.ones(seq_len, seq_len, device=x.device), diagonal=1).bool()
+            # MultiHeadSpatiotemporalAttention expects mask where 0 is masked out?
+            # Let's check implementation: scores.masked_fill(mask == 0, -1e9)
+            # So mask should be 1 for keep, 0 for mask.
+            # triu gives 1s in upper triangle (future). We want to mask future.
+            # So we want 0s in upper triangle.
+            mask = torch.tril(torch.ones(seq_len, seq_len, device=x.device))
+        
         # Self-attention with residual connection
         attn_output = self.attention(x, x, x, mask)
         x = self.norm1(x + self.dropout(attn_output))
+        
+        # Cross-attention (only for decoder)
+        if self.is_decoder and encoder_output is not None:
+            # Attend to encoder output
+            # Query comes from decoder (x), Key/Value come from encoder (encoder_output)
+            cross_attn_output = self.cross_attention(x, encoder_output, encoder_output)
+            x = self.norm3(x + self.dropout(cross_attn_output))
         
         # Feed-forward with residual connection
         ff_output = self.ff(x)
