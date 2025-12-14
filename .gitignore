@@ -26,3 +26,6 @@ __pycache__/
 .DS_Store
 Thumbs.db
 
+future_prices/es_with_indicators.csv
+./venv
+future_prices/es_with_indicators.csv
