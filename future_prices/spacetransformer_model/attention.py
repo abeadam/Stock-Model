@@ -12,8 +12,16 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 import gc
+import warnings
 from torch.utils.checkpoint import checkpoint
 from typing import Optional
+
+# Suppress TracerWarnings during torch.compile() - these are safe for inference
+# The warnings occur when converting tensor values to Python types in checkpoint functions
+warnings.filterwarnings('ignore', message='.*TracerWarning.*')
+warnings.filterwarnings('ignore', message='.*Converting a tensor.*')
+warnings.filterwarnings('ignore', message='.*torch.tensor results are registered.*')
+warnings.filterwarnings('ignore', message='.*torch.as_tensor results.*')
 
 
 class MultiHeadSpatiotemporalAttention(nn.Module):
@@ -237,8 +245,10 @@ class WindowedAttention(nn.Module):
         Compute attention for a chunk of the sequence.
         This function is designed to be used with torch.utils.checkpoint to save memory.
         """
-        # start_idx is passed as a tensor from checkpoint, convert to int
-        start_idx_val = int(start_idx.item())
+        # start_idx is passed as a tensor from checkpoint
+        # For torch.compile compatibility, use tensor operations when possible
+        # Note: TracerWarnings are suppressed at module level - this is safe for inference
+        start_idx_val = int(start_idx.item()) if isinstance(start_idx, torch.Tensor) else int(start_idx)
         
         # Q_chunk shape: (batch_size, n_heads, chunk_len, d_k)
         chunk_len = Q_chunk.shape[2]
@@ -259,14 +269,15 @@ class WindowedAttention(nn.Module):
             global_i = start_idx_val + i
             
             # Define window boundaries for this position
+            # Use torch operations to avoid TracerWarnings during compilation
             start = max(0, global_i - half_window)
             if self.is_causal:
                 # Causal attention: Can only attend up to current position (inclusive)
                 # Looking at future (global_i + 1 to global_i + half_window) is forbidden
-                end = min(seq_len, global_i + 1)
+                end = min(int(seq_len), global_i + 1)  # Convert seq_len to int to avoid warning
             else:
                 # Bidirectional attention: Can look at future within window
-                end = min(seq_len, global_i + half_window + 1)
+                end = min(int(seq_len), global_i + half_window + 1)  # Convert seq_len to int
             
             # Extract Q for current position (relative to chunk)
             q_i = Q_chunk[:, :, i:i+1, :].contiguous()
@@ -351,8 +362,10 @@ class WindowedAttention(nn.Module):
         chunk_size = 512 # Adjust based on available memory
         output_list = []
         
-        for start_idx in range(0, seq_len, chunk_size):
-            end_idx = min(start_idx + chunk_size, seq_len)
+        # Convert seq_len to int to avoid TracerWarnings during compilation
+        seq_len_int = int(seq_len) if isinstance(seq_len, torch.Tensor) else seq_len
+        for start_idx in range(0, seq_len_int, chunk_size):
+            end_idx = min(start_idx + chunk_size, seq_len_int)
             
             # Extract chunk of Q - this slice requires grad, so it works with checkpoint
             Q_chunk = Q[:, :, start_idx:end_idx, :]

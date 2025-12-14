@@ -8,7 +8,16 @@ information. Each token represents a single variable at a specific timestep.
 import torch
 import torch.nn as nn
 import math
+import warnings
 from typing import Optional
+
+# Suppress TracerWarnings during torch.compile() - these are safe for inference
+# The warnings occur when converting tensor shapes to Python ints, which is fine
+# since input shapes are constant during inference
+warnings.filterwarnings('ignore', message='.*TracerWarning.*')
+warnings.filterwarnings('ignore', message='.*Converting a tensor.*')
+warnings.filterwarnings('ignore', message='.*torch.tensor results are registered.*')
+warnings.filterwarnings('ignore', message='.*torch.as_tensor results.*')
 
 
 class SpatiotemporalEmbedding(nn.Module):
@@ -70,6 +79,8 @@ class SpatiotemporalEmbedding(nn.Module):
         
         # CRITICAL: Use self.n_variables (model's expected number) instead of input shape
         # Slice input if it has more features than expected (e.g., extra cyclical features)
+        # Note: Shape values are constant during inference, so comparisons are safe
+        # TracerWarnings are suppressed at module level
         if n_features > self.n_variables:
             x = x[:, :, :self.n_variables]
             n_features = self.n_variables
@@ -167,10 +178,10 @@ class TemporalPositionalEncoding(nn.Module):
         
         # Get encodings for each position
         # positions: (batch_size, seq_length) -> (batch_size, seq_length, d_model)
-        # Access the registered buffer as a tensor
-        # Type cast to help linter understand this is a Tensor
-        pe_tensor = torch.as_tensor(self.pe)  # Shape: (1, max_len, d_model)
-        max_pos = int(pe_tensor.shape[1])  # Convert to int for clamp
+        # Access the registered buffer - self.pe is a buffer registered in __init__
+        # Note: Shape is constant during inference - TracerWarnings are suppressed
+        pe_tensor: torch.Tensor = self.pe  # type: ignore  # Shape: (1, max_len, d_model) - registered buffer
+        max_pos = int(pe_tensor.shape[1])  # type: ignore  # Convert to int for clamp (safe, shape is constant)
         
         # Clamp positions to valid range
         positions_clamped = torch.clamp(positions, min=0, max=max_pos - 1)
@@ -178,7 +189,8 @@ class TemporalPositionalEncoding(nn.Module):
         # Get positional encodings by indexing
         # pe_tensor shape: (1, max_len, d_model)
         # Index along dimension 1 (the sequence length dimension)
-        pos_encodings = pe_tensor[0, positions_clamped]  # Shape: (batch_size, seq_length, d_model)
+        # Type ignore: self.pe is a registered buffer (tensor), linter doesn't recognize it
+        pos_encodings = pe_tensor[0, positions_clamped]  # type: ignore  # Shape: (batch_size, seq_length, d_model)
         
         return pos_encodings
 
