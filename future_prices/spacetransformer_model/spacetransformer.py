@@ -40,7 +40,12 @@ def main(
     test_size: float = 0.2,
     random_state: int = 42,
     save_model_path: Optional[str] = None,
-    golden_test: bool = False
+    golden_test: bool = False,
+    use_amp: bool = True,
+    gradient_accumulation_steps: int = 1,
+    compile_model: bool = False,
+    use_gpu_optimizations: bool = False,
+    resume_path: Optional[str] = None
 ):
     """
     Main function to train SpaceTimeFormer model.
@@ -62,6 +67,10 @@ def main(
         random_state: Random seed
         save_model_path: Path to save trained model (optional)
         golden_test: If True, run in golden test mode (minimal data)
+        use_amp: Use Automatic Mixed Precision (FP16) for faster training
+        gradient_accumulation_steps: Accumulate gradients over N steps (effective batch size = batch_size * N)
+        compile_model: Use torch.compile() for faster execution (PyTorch 2.0+)
+        use_gpu_optimizations: If True, enables all GPU optimizations (larger batches, more workers, prefetching)
     """
     print("=" * 80)
     print("SpaceTimeFormer Training Pipeline")
@@ -145,11 +154,66 @@ def main(
     print(f"  -> Validation sequences: {len(val_dataset)}")
     print(f"  -> Test sequences: {len(test_dataset)}")
     
-    # Create data loaders
+    # Check for empty datasets
+    if len(train_dataset) == 0:
+        raise ValueError(
+            f"Training dataset is empty! Need at least {context_length + target_length} samples. "
+            f"Got {len(X_train)} training samples. Try reducing context_length or loading more data."
+        )
+    if len(val_dataset) == 0:
+        raise ValueError(
+            f"Validation dataset is empty! Need at least {context_length + target_length} samples. "
+            f"Got {len(X_train)} training samples. Try reducing context_length or loading more data."
+        )
+    
+    # Create data loaders with optimizations for GPU
     print("\n[3/5] Creating data loaders...")
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+    # Optimize DataLoader for GPU based on use_gpu_optimizations flag
+    if use_gpu_optimizations:
+        # Aggressive optimizations: more workers, prefetching
+        num_workers = min(8, os.cpu_count() or 1)  # Increased to 8 workers for better throughput
+        prefetch_factor = 2 if batch_size >= 32 else 1
+    else:
+        # Conservative defaults
+        num_workers = min(4, os.cpu_count() or 1)  # Standard 4 workers
+        prefetch_factor = 1  # No prefetching
+    
+    pin_memory = torch.cuda.is_available()
+    
+    train_loader = DataLoader(
+        train_dataset, 
+        batch_size=batch_size, 
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        persistent_workers=num_workers > 0,  # Keep workers alive between epochs
+        prefetch_factor=prefetch_factor  # Prefetch batches for better GPU utilization
+    )
+    val_loader = DataLoader(
+        val_dataset, 
+        batch_size=batch_size, 
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        persistent_workers=num_workers > 0,
+        prefetch_factor=prefetch_factor
+    )
+    test_loader = DataLoader(
+        test_dataset, 
+        batch_size=batch_size, 
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        persistent_workers=num_workers > 0,
+        prefetch_factor=prefetch_factor
+    )
+    
+    if num_workers > 0:
+        print(f"  -> Using {num_workers} worker(s) for data loading")
+    if pin_memory:
+        print(f"  -> Using pinned memory for faster GPU transfers")
+    if prefetch_factor > 1:
+        print(f"  -> Prefetching {prefetch_factor} batches ahead for better GPU utilization")
     
     print(f"  -> Train batches: {len(train_loader)}")
     print(f"  -> Val batches: {len(val_loader)}")
@@ -183,6 +247,19 @@ def main(
         use_windowed_attn=True,  # Enable windowed attention for memory efficiency
         window_size=window_size
     )
+    
+    # Resume from checkpoint if provided
+    if resume_path and os.path.exists(resume_path):
+        print(f"\n[4.5/5] Resuming from checkpoint: {resume_path}")
+        try:
+            # Load on CPU first to avoid OOM, then model.to(device) handles moving
+            checkpoint = torch.load(resume_path, map_location='cpu')
+            model.load_state_dict(checkpoint['model_state_dict'])
+            print("  -> Weights loaded successfully")
+        except Exception as e:
+            print(f"  -> WARNING: Could not load checkpoint: {e}")
+            print("  -> Check if architecture (d_model, n_heads, etc.) matches.")
+            print("  -> Continuing with random initialization...")
     
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -228,7 +305,10 @@ def main(
         patience=15,
         save_path=save_model_path,
         target_indices=target_indices,
-        scaler=scaler  # Pass scaler to save in checkpoint
+        scaler=scaler,  # Pass scaler to save in checkpoint
+        use_amp=use_amp,
+        gradient_accumulation_steps=gradient_accumulation_steps,
+        compile_model=compile_model
     )
     
     print("\n" + "=" * 80)

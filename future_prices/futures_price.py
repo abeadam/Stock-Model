@@ -592,30 +592,9 @@ def plot_results(df: pd.DataFrame, save_path: Optional[str] = None, last_n_point
     ax10.legend(loc='best', fontsize=8)
     ax10.grid(True, alpha=0.3)
     
-    # Plot 11: Percent Change to Max High (next 5 periods)
-    ax11 = plt.subplot(7, 2, 11)
-    ax11.plot(df_plot['Date'], df_plot['PctChange_ToMaxHigh_5'], label='% Change to Max High (next 5)', 
-             linewidth=1.5, color='green', alpha=0.8)
-    ax11.axhline(y=0, color='black', linestyle='-', alpha=0.5, linewidth=0.8)
-    ax11.set_title('Percent Change: Current Close to Max High (next 5 periods)', fontsize=12, fontweight='bold')
-    ax11.set_xlabel('Date')
-    ax11.set_ylabel('Percent Change (%)')
-    ax11.legend(loc='best', fontsize=8)
-    ax11.grid(True, alpha=0.3)
-    
-    # Plot 12: Percent Change to Min Low (next 5 periods)
-    ax12 = plt.subplot(7, 2, 12)
-    ax12.plot(df_plot['Date'], df_plot['PctChange_ToMinLow_5'], label='% Change to Min Low (next 5)', 
-              linewidth=1.5, color='red', alpha=0.8)
-    ax12.axhline(y=0, color='black', linestyle='-', alpha=0.5, linewidth=0.8)
-    ax12.set_title('Percent Change: Current Close to Min Low (next 5 periods)', fontsize=12, fontweight='bold')
-    ax12.set_xlabel('Date')
-    ax12.set_ylabel('Percent Change (%)')
-    ax12.legend(loc='best', fontsize=8)
-    ax12.grid(True, alpha=0.3)
-    
+
     # Plot 13: Percent Change from Close to High (current bar)
-    ax13 = plt.subplot(7, 2, 13)
+    ax13 = plt.subplot(7, 2, 11)
     ax13.plot(df_plot['Date'], df_plot['PctChange_CloseToHigh'], label='% Change: Close to High', 
               linewidth=1.5, color='green', alpha=0.8)
     ax13.axhline(y=0, color='black', linestyle='-', alpha=0.5, linewidth=0.8)
@@ -626,7 +605,7 @@ def plot_results(df: pd.DataFrame, save_path: Optional[str] = None, last_n_point
     ax13.grid(True, alpha=0.3)
     
     # Plot 14: Percent Change from Close to Low (current bar)
-    ax14 = plt.subplot(7, 2, 14)
+    ax14 = plt.subplot(7, 2, 12)
     ax14.plot(df_plot['Date'], df_plot['PctChange_CloseToLow'], label='% Change: Close to Low', 
               linewidth=1.5, color='red', alpha=0.8)
     ax14.axhline(y=0, color='black', linestyle='-', alpha=0.5, linewidth=0.8)
@@ -667,8 +646,8 @@ def main():
             raise ValueError("ES data processing failed - insufficient data")
         
         # Calculate forward percent changes (ES only)
-        print("Calculating forward percent changes for ES...")
-        df = calculate_forward_percent_changes(df, periods=5)
+        # print("Calculating forward percent changes for ES...")
+        # df = calculate_forward_percent_changes(df, periods=5)
         
         # Skip last 5 values (to avoid NaN from forward calculations)
         initial_len_after_indicators = len(df)
@@ -718,9 +697,6 @@ def main():
         print(f"\nPercent Changes (current bar):")
         print(f"  Close to High: Mean={df['PctChange_CloseToHigh'].mean():.4f}%, Min={df['PctChange_CloseToHigh'].min():.4f}%, Max={df['PctChange_CloseToHigh'].max():.4f}%")
         print(f"  Close to Low: Mean={df['PctChange_CloseToLow'].mean():.4f}%, Min={df['PctChange_CloseToLow'].min():.4f}%, Max={df['PctChange_CloseToLow'].max():.4f}%")
-        print(f"\nPercent Changes (next 5 periods):")
-        print(f"  To Max High: Mean={df['PctChange_ToMaxHigh_5'].mean():.4f}%, Min={df['PctChange_ToMaxHigh_5'].min():.4f}%, Max={df['PctChange_ToMaxHigh_5'].max():.4f}%")
-        print(f"  To Min Low: Mean={df['PctChange_ToMinLow_5'].mean():.4f}%, Min={df['PctChange_ToMinLow_5'].min():.4f}%, Max={df['PctChange_ToMinLow_5'].max():.4f}%")
         
         # Plot results
         print("\nGenerating plots...")

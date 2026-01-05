@@ -7,9 +7,10 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 from typing import Tuple, Optional, List, TYPE_CHECKING
+import torch.cuda.amp
 import numpy as np
-import gc
 import time
+import gc
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 
 if TYPE_CHECKING:
@@ -74,7 +75,10 @@ def train_epoch(
     optimizer: optim.Optimizer,
     criterion: nn.Module,
     device: torch.device,
-    target_indices: list[int]
+    target_indices: list[int],
+    use_amp: bool = False,
+    scaler: Optional[torch.cuda.amp.GradScaler] = None,
+    gradient_accumulation_steps: int = 1
 ) -> float:
     """
     Train model for one epoch.
@@ -86,6 +90,9 @@ def train_epoch(
         criterion: Loss function
         device: Device to train on
         target_indices: Indices of the target variables in the feature set (for loss calculation)
+        use_amp: Whether to use Automatic Mixed Precision (FP16)
+        scaler: GradScaler for mixed precision training
+        gradient_accumulation_steps: Number of steps to accumulate gradients before optimizer step
     
     Returns:
         Average training loss
@@ -96,38 +103,56 @@ def train_epoch(
     total_batches = len(train_loader)
     
     for batch_idx, (batch_X, batch_target_X) in enumerate(train_loader):
-        batch_X = batch_X.to(device)  # (batch_size, context_length, n_features)
-        batch_target_X = batch_target_X.to(device) # (batch_size, target_length, n_features)
+        # Non-blocking transfer for better GPU utilization
+        batch_X = batch_X.to(device, non_blocking=True)  # (batch_size, context_length, n_features)
+        batch_target_X = batch_target_X.to(device, non_blocking=True) # (batch_size, target_length, n_features)
         
-        # Forward pass
-        optimizer.zero_grad(set_to_none=True)
+        # Zero gradients only at the start of accumulation cycle
+        if batch_idx % gradient_accumulation_steps == 0:
+            optimizer.zero_grad(set_to_none=True)
         
-        # Use full target features for teacher forcing
-        predictions = model(batch_X, batch_target_X)
+        # Forward pass with mixed precision
+        with torch.cuda.amp.autocast(enabled=use_amp):
+            # Use full target features for teacher forcing
+            predictions = model(batch_X, batch_target_X)
+            
+            # Predictions shape: (batch_size, target_length, n_variables)
+            # We compute loss on the specific target columns
+            target_predictions = predictions[:, :, target_indices]
+            
+            # Ground truth for these specific columns
+            target_truth = batch_target_X[:, :, target_indices]
+            
+            # Calculate loss (scale by accumulation steps for correct averaging)
+            loss = criterion(target_predictions, target_truth) / gradient_accumulation_steps
         
-        # Predictions shape: (batch_size, target_length, n_variables)
-        # We compute loss on the specific target columns
-        target_predictions = predictions[:, :, target_indices]
+        # Backward pass with mixed precision
+        if use_amp and scaler is not None:
+            scaler.scale(loss).backward()
+        else:
+            loss.backward()
         
-        # Ground truth for these specific columns
-        target_truth = batch_target_X[:, :, target_indices]
+        # Update weights only after accumulating gradients
+        if (batch_idx + 1) % gradient_accumulation_steps == 0:
+            # Gradient clipping for stability
+            if use_amp and scaler is not None:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
         
-        # Calculate loss
-        loss = criterion(target_predictions, target_truth)
-        
-        # Backward pass
-        loss.backward()
-        
-        # Gradient clipping for stability
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        
-        optimizer.step()
-        
-        # Store loss value before deleting tensors
-        loss_value = loss.item()
+        # Store loss value (multiply by accumulation steps to get true loss)
+        loss_value = loss.item() * gradient_accumulation_steps
         
         # Delete intermediate tensors to free memory
         del batch_X, batch_target_X, predictions, target_predictions, target_truth, loss
+        
+        # Periodic memory cleanup for large batches
+        if n_batches % 50 == 0 and device.type == 'cuda':
+            torch.cuda.empty_cache()
         
         total_loss += loss_value
         n_batches += 1
@@ -148,7 +173,8 @@ def validate(
     val_loader: DataLoader,
     criterion: nn.Module,
     device: torch.device,
-    target_indices: list[int]
+    target_indices: list[int],
+    use_amp: bool = False
 ) -> Tuple[float, dict]:
     """
     Validate model.
@@ -173,15 +199,16 @@ def validate(
     
     with torch.no_grad():
         for batch_idx, (batch_X, batch_target_X) in enumerate(val_loader):
-            batch_X = batch_X.to(device)
-            batch_target_X = batch_target_X.to(device)
+            batch_X = batch_X.to(device, non_blocking=True)
+            batch_target_X = batch_target_X.to(device, non_blocking=True)
             
-            # Autoregressive generation
+            # Autoregressive generation with mixed precision
             # For true multi-step forecasting, we feed predictions back as input
             batch_size = batch_X.shape[0]
             target_length = batch_target_X.shape[1]
             
-            encoder_output = model.encode(batch_X) # type: ignore
+            with torch.cuda.amp.autocast(enabled=use_amp):
+                encoder_output = model.encode(batch_X) # type: ignore
             
             # Initial input: Last context step
             # Shape: (batch_size, 1, n_features)
@@ -194,11 +221,8 @@ def validate(
                 # Predict next step using accumulated sequence and cached encoder output
                 # Note: We still re-process the decoder sequence, but avoid re-encoding context
                 
-                # Check memory before forward pass
-                # if device.type == 'cuda':
-                #      torch.cuda.empty_cache()
-
-                step_predictions = model.decode(current_input, encoder_output) # type: ignore
+                with torch.cuda.amp.autocast(enabled=use_amp):
+                    step_predictions = model.decode(current_input, encoder_output) # type: ignore
                 
                 # Get the prediction for the last step
                 # Shape: (batch_size, 1, n_features)
@@ -220,8 +244,9 @@ def validate(
             # Ground truth
             target_truth = batch_target_X[:, :, target_indices]
             
-            # Calculate loss
-            loss = criterion(target_predictions, target_truth)
+            # Calculate loss with mixed precision
+            with torch.cuda.amp.autocast(enabled=use_amp):
+                loss = criterion(target_predictions, target_truth)
             
             total_loss += loss.item()
             
@@ -279,7 +304,10 @@ def train_model(
     patience: int = 10,
     save_path: Optional[str] = None,
     target_indices: Optional[list[int]] = None,
-    scaler: Optional[object] = None
+    scaler: Optional[object] = None,
+    use_amp: bool = True,
+    gradient_accumulation_steps: int = 1,
+    compile_model: bool = False
 ) -> dict:
     """
     Train SpaceTimeFormer model.
@@ -303,11 +331,28 @@ def train_model(
     
     model = model.to(device)
     
+    # Compile model for faster execution (PyTorch 2.0+)
+    if compile_model and hasattr(torch, 'compile'):
+        print("  -> Compiling model with torch.compile() for faster execution...")
+        try:
+            # torch.compile returns a callable, but we can still use it as a model
+            compiled_model = torch.compile(model, mode='reduce-overhead')  # type: ignore
+            model = compiled_model  # type: ignore
+            print("  -> Model compiled successfully")
+        except Exception as e:
+            print(f"  -> Warning: Could not compile model: {e}")
+    
     # Loss function
     criterion = nn.MSELoss()
     
     # Optimizer
     optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-4)
+    
+    # Mixed precision scaler
+    amp_scaler = None
+    if use_amp and device.type == 'cuda':
+        amp_scaler = torch.cuda.amp.GradScaler()
+        print("  -> Using Automatic Mixed Precision (FP16) for faster training")
     
     # Learning rate scheduler
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
@@ -338,8 +383,31 @@ def train_model(
     print(f"Validation batches: {len(val_loader)}")
     print(f"Initial learning rate: {learning_rate}")
     print(f"Early stopping patience: {patience}")
+    print(f"Mixed Precision (AMP): {use_amp}")
+    print(f"Gradient Accumulation Steps: {gradient_accumulation_steps}")
+    effective_batch_size = (train_loader.batch_size or 1) * gradient_accumulation_steps
+    print(f"Effective Batch Size: {effective_batch_size}")
     if device.type == 'cuda':
-        print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
+        gpu_name = torch.cuda.get_device_name(0)
+        total_memory = torch.cuda.get_device_properties(0).total_memory / 1e9
+        print(f"GPU: {gpu_name}")
+        print(f"GPU Memory: {total_memory:.2f} GB")
+        
+        # Show current memory usage
+        allocated = torch.cuda.memory_allocated(0) / 1e9
+        reserved = torch.cuda.memory_reserved(0) / 1e9
+        print(f"  Allocated: {allocated:.2f} GB")
+        print(f"  Reserved: {reserved:.2f} GB")
+        print(f"  Available: {total_memory - reserved:.2f} GB")
+        
+        try:
+            # Try to get CUDA version if available
+            version_module = getattr(torch, 'version', None)
+            if version_module:
+                cuda_version = getattr(version_module, 'cuda', 'Unknown')
+                print(f"CUDA Version: {cuda_version}")
+        except (AttributeError, TypeError):
+            pass
     print(f"{'='*80}\n")
     
     if target_indices is None:
@@ -349,10 +417,13 @@ def train_model(
         epoch_start_time = time.time()
         
         # Train
-        train_loss = train_epoch(model, train_loader, optimizer, criterion, device, target_indices)
+        train_loss = train_epoch(
+            model, train_loader, optimizer, criterion, device, target_indices,
+            use_amp=use_amp, scaler=amp_scaler, gradient_accumulation_steps=gradient_accumulation_steps
+        )
         
         # Validate
-        val_loss, val_metrics = validate(model, val_loader, criterion, device, target_indices)
+        val_loss, val_metrics = validate(model, val_loader, criterion, device, target_indices, use_amp=use_amp)
         
         # Update learning rate
         current_lr = optimizer.param_groups[0]['lr']
@@ -408,7 +479,13 @@ def train_model(
         if device.type == 'cuda':
             allocated = torch.cuda.memory_allocated(device) / 1e9
             reserved = torch.cuda.memory_reserved(device) / 1e9
-            print(f"GPU Memory: {allocated:.2f} GB allocated, {reserved:.2f} GB reserved")
+            total = torch.cuda.get_device_properties(device).total_memory / 1e9
+            utilization = (reserved / total) * 100
+            print(f"GPU Memory: {allocated:.2f} GB allocated, {reserved:.2f} GB reserved ({utilization:.1f}% utilization)")
+            
+            # Warn if memory usage is low (could use larger batch)
+            if utilization < 60:
+                print(f"  → Consider increasing batch_size (currently using {utilization:.1f}% of GPU memory)")
         
         print(f"{'='*80}")
         

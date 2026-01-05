@@ -5,7 +5,6 @@ This module implements the main SpaceTimeFormer model for multivariate time seri
 The model uses spatiotemporal attention to learn patterns across both variables and time.
 """
 
-import gc
 import torch
 import torch.nn as nn
 from typing import Optional

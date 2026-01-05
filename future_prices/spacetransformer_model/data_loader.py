@@ -39,9 +39,12 @@ def load_data(data_path: str,
     # No target columns; we predict all and focus loss elsewhere
     
     # For golden test, only read the rows we need
+    # Need enough rows to create at least a few sequences after train/test split
     if golden_test:
-        # Read batch_size * 2 rows as requested
-        nrows_to_read = 128
+        # Read enough rows to create sequences (need context_length + target_length per sequence)
+        # With 80/20 split, we need at least (context_length + target_length) * 2 / 0.8 rows
+        # For safety, read at least 500 rows or batch_size * 10, whichever is larger
+        nrows_to_read = max(500, batch_size * 10)
         print(f"GOLDEN TEST MODE: Reading only first {nrows_to_read} rows from CSV")
         df = pd.read_csv(data_path, nrows=nrows_to_read)
     elif max_rows is not None:
@@ -63,8 +66,8 @@ def load_data(data_path: str,
     
     # Remove duplicates
     exclude_cols = list(set(exclude_cols))
-    feature_cols = [col for col in df.columns if col not in exclude_cols]
-    
+    # feature_cols = [col for col in df.columns if col not in exclude_cols]
+    feature_cols = ['Open', 'High', 'Low', 'Close', 'Volume', 'hour_sin', 'hour_cos', 'BB_20_MA', 'BB_20_2_Upper', 'BB_20_2_Lower', 'MFI_14']
     print(f"Using {len(feature_cols)} features")
     
     # Extract features and target(s)

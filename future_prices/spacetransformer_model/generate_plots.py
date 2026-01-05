@@ -374,9 +374,9 @@ def main():
     data_path = '/home/wiseguy/dev/future_prices/es_with_indicators.csv'
     
     # Model hyperparameters (should match training)
-    context_length = 48
+    context_length = 96
     target_length = 24
-    batch_size = 2
+    batch_size = 128
     test_size = 0.3
     random_state = 42
     
@@ -493,6 +493,10 @@ def main():
     print("\n" + "="*80)
     print("Prediction Metrics")
     print("="*80)
+    print("\nNOTE: Metrics below are calculated on UNSCALED (actual price) data.")
+    print("      For model quality assessment, refer to training validation metrics")
+    print("      which are calculated on scaled data (R² ≈ 0.85 indicates good performance).")
+    print("="*80)
     
     for target_idx, target_name in enumerate(target_columns):
         if target_idx >= len(target_indices):
@@ -505,16 +509,28 @@ def main():
         mae = np.mean(np.abs(pred_flat - true_flat))
         rmse = np.sqrt(mse)
         
-        # R² score
+        # Calculate percentage errors (more interpretable than R² on unscaled data)
+        mean_price = np.mean(np.abs(true_flat))
+        mape = (mae / mean_price * 100) if mean_price > 0 else 0
+        rmse_percent = (rmse / mean_price * 100) if mean_price > 0 else 0
+        
+        # R² score (may be misleading on unscaled data due to scale differences)
         ss_res = np.sum((true_flat - pred_flat) ** 2)
         ss_tot = np.sum((true_flat - np.mean(true_flat)) ** 2)
         r2 = 1 - (ss_res / ss_tot) if ss_tot > 0 else 0
         
         print(f"\n{target_name}:")
-        print(f"  MSE:  {mse:.6f}")
-        print(f"  MAE:  {mae:.6f}")
-        print(f"  RMSE: {rmse:.6f}")
-        print(f"  R²:   {r2:.6f}")
+        print(f"  MSE:      {mse:.6f}")
+        print(f"  MAE:      {mae:.6f}  ({mape:.2f}% of mean price)")
+        print(f"  RMSE:     {rmse:.6f}  ({rmse_percent:.2f}% of mean price)")
+        print(f"  R²:       {r2:.6f}  (NOTE: R² on unscaled data can be misleading)")
+        print(f"  Mean Price: {mean_price:.2f}")
+        
+        # Additional context
+        if r2 < 0:
+            print(f"  → Negative R² indicates prediction errors are larger than")
+            print(f"    variance of target, but this can be misleading on unscaled data.")
+            print(f"    Focus on RMSE/MAE percentages instead.")
     
     # Generate plots
     print("\n" + "="*80)
