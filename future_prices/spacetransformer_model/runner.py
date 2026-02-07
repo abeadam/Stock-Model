@@ -2,7 +2,7 @@
 Runner script for SpaceTimeFormer model training
 
 This script provides a simple way to train the SpaceTimeFormer model.
-Optimized for P100 GPU (16GB VRAM) with aggressive memory usage for maximum speed.
+Optimized for high-end hardware (e.g., Apple M-series Max/Ultra or P100/A100 GPUs).
 """
 
 import sys
@@ -21,14 +21,16 @@ os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True,max_split_size
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from spacetransformer_model.spacetransformer import main
+from spacetransformer_model.utils import get_device, empty_cache
 
 def find_optimal_batch_size(start_batch=32, max_batch=128, context_length=96, 
-                           d_model=128, n_heads=8, d_ff=512):
+                           d_model=128, n_heads=8, d_ff=512, enc_layers=3, dec_layers=3):
     """
     Find the maximum batch size that fits in GPU memory.
     Tries progressively larger batches until OOM, then uses the last working size.
     """
-    if not torch.cuda.is_available():
+    device = get_device()
+    if device.type == 'cpu':
         return start_batch
     
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -42,7 +44,7 @@ def find_optimal_batch_size(start_batch=32, max_batch=128, context_length=96,
         current *= 2
     
     print("=" * 80)
-    print("Finding Optimal Batch Size for P100 GPU")
+    print(f"Finding Optimal Batch Size for {device.type.upper()}")
     print("=" * 80)
     
     optimal_batch = start_batch
@@ -50,7 +52,7 @@ def find_optimal_batch_size(start_batch=32, max_batch=128, context_length=96,
         print(f"\nTrying batch_size={batch_size}...")
         try:
             # Clear cache before test
-            torch.cuda.empty_cache()
+            empty_cache(device)
             
             # Quick test with minimal epochs
             model, history, scaler, feature_names = main(
@@ -61,8 +63,8 @@ def find_optimal_batch_size(start_batch=32, max_batch=128, context_length=96,
                 d_model=d_model,
                 n_heads=n_heads,
                 d_ff=d_ff,
-                enc_layers=3,
-                dec_layers=3,
+                enc_layers=enc_layers,
+                dec_layers=dec_layers,
                 n_epochs=1,  # Just test memory, not full training
                 use_amp=True,  # Use FP16 to save memory
                 gradient_accumulation_steps=1,
@@ -75,12 +77,12 @@ def find_optimal_batch_size(start_batch=32, max_batch=128, context_length=96,
             
             # Clean up
             del model, history, scaler
-            torch.cuda.empty_cache()
+            empty_cache(device)
             
         except RuntimeError as e:
-            if "out of memory" in str(e):
+            if "out of memory" in str(e).lower() or "mps" in str(e).lower():
                 print(f"✗ OOM with batch_size={batch_size}")
-                torch.cuda.empty_cache()
+                empty_cache(device)
                 break
             else:
                 raise
@@ -115,33 +117,45 @@ if __name__ == '__main__':
     # Configure settings based on flags
     # ============================================================================
     if USE_GPU_OPTIMIZATIONS:
-        # P100-optimized settings: Use more GPU memory for faster training
-        # With FP16, we can use 2-4x larger batches than FP32
+        # Configuration for High-End Mac (40-core GPU / 52GB Memory)
+        # Strategy: Since batch size is capped at 128 due to OOM, we maximize
+        # computation per sample by:
+        # 1. Increasing model dimensions (d_model, d_ff, layers)
+        # 2. Using gradient accumulation to simulate larger effective batch size
+        # 3. Deeper networks = more parallel computation per sample
         
         if USE_OPTIMAL_BATCH:
+            # Use the same model dimensions as the optimized config
             optimal_batch = find_optimal_batch_size(
-                start_batch=16,
-                max_batch=128,
+                start_batch=64,      # Start lower to find safe batch size
+                max_batch=256,       # Test up to 256, but expect ~128 to be max
                 context_length=96,
-                d_model=128,
-                n_heads=8,
-                d_ff=512
+                d_model=512,         # Match optimized config (memory-efficient)
+                n_heads=16,
+                d_ff=2048,
+                enc_layers=4,
+                dec_layers=4
             )
             batch_size = optimal_batch
         else:
-            # Aggressive settings for P100 with FP16
-            # These should work well for 16GB VRAM
-            batch_size = 128  # Can go up to 64-128 with FP16
+            # Batch size is capped at 128 due to memory, so we maximize compute per sample
+            batch_size = 128  # Maximum before OOM
         
-        # Optimized model settings
-        context_length = 96  # Full context length for better model capacity
-        d_model = 128        # Medium model size - good balance
-        d_ff = 512           # Standard feed-forward dimension
-        n_heads = 8          # Standard number of heads
+        # Balanced model capacity to fit in ~80GB memory while maximizing GPU utilization
+        # Strategy: Moderate model size + gradient accumulation + deeper networks
+        context_length = 96  # Full context length
+        d_model = 512        # Large but memory-efficient model size
+        d_ff = 2048          # 4x d_model for feed-forward (standard ratio)
+        n_heads = 16         # d_model must be divisible by n_heads (512/16=32)
+        enc_layers = 4       # Deeper encoder (increased from 3, but not too deep)
+        dec_layers = 4       # Deeper decoder (increased from 3, but not too deep)
         
         # GPU optimizations enabled
         use_amp = True
-        gradient_accumulation_steps = 1
+        # Gradient accumulation simulates larger batch size without using more memory
+        # Effective batch size = batch_size * gradient_accumulation_steps
+        # This helps with training stability and better gradient estimates
+        gradient_accumulation_steps = 4  # Effective batch = 128 * 4 = 512
         compile_model = True
     else:
         # Conservative default settings (original behavior)
@@ -158,8 +172,10 @@ if __name__ == '__main__':
     
     # Common settings
     target_length = 24
-    enc_layers = 3
-    dec_layers = 3
+    # enc_layers and dec_layers are set above in USE_GPU_OPTIMIZATIONS block
+    if not USE_GPU_OPTIMIZATIONS:
+        enc_layers = 3
+        dec_layers = 3
     n_epochs = 100
     learning_rate = 1e-3
     

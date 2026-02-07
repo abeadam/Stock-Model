@@ -18,6 +18,7 @@ from typing import Optional
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from spacetransformer_model.model import SpaceTimeFormer
+from spacetransformer_model.utils import get_device
 
 
 class TimeoutError(Exception):
@@ -386,9 +387,9 @@ def main():
     parser.add_argument(
         '--device',
         type=str,
-        default='cpu',
-        choices=['cpu', 'cuda'],
-        help='Device to use for conversion (default: cpu)'
+        default=None,
+        choices=['cpu', 'cuda', 'mps'],
+        help='Device to use for conversion (default: auto-detect)'
     )
     parser.add_argument(
         '--opset',
@@ -425,10 +426,15 @@ def main():
     if output_dir and not os.path.exists(output_dir):
         os.makedirs(output_dir)
     
+    # Device setup
+    device_name = args.device
+    if device_name is None:
+        device_name = str(get_device())
+    
     convert_to_onnx(
         checkpoint_path=args.checkpoint,
         output_path=args.output,
-        device=args.device,
+        device=device_name,
         opset_version=args.opset,
         verbose=args.verbose,
         debug=args.debug,

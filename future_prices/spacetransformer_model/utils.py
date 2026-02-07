@@ -4,6 +4,43 @@ Utility functions for SpaceTimeFormer model.
 
 import pandas as pd
 import numpy as np
+import torch
+
+
+def get_device() -> torch.device:
+    """
+    Get the best available device (CUDA, MPS, or CPU).
+    
+    Returns:
+        torch.device: The best available device
+    """
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+
+def empty_cache(device: torch.device):
+    """
+    Empty the cache for the specified device.
+    """
+    if device.type == 'cuda':
+        torch.cuda.empty_cache()
+    elif device.type == 'mps':
+        if hasattr(torch, 'mps') and hasattr(torch.mps, 'empty_cache'):
+            torch.mps.empty_cache()
+
+
+def synchronize(device: torch.device):
+    """
+    Synchronize the specified device.
+    """
+    if device.type == 'cuda':
+        torch.cuda.synchronize()
+    elif device.type == 'mps':
+        if hasattr(torch, 'mps') and hasattr(torch.mps, 'synchronize'):
+            torch.mps.synchronize()
 
 
 def extract_cyclical_time_features(df: pd.DataFrame) -> pd.DataFrame:

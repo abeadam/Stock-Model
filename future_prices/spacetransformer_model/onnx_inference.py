@@ -72,7 +72,12 @@ class ONNXPredictor:
         # Setup execution providers
         if providers is None:
             # Auto-detect: prefer GPU if available
-            providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
+            providers = [
+                'CUDAExecutionProvider', 
+                'CoreMLExecutionProvider', # Mac Apple Silicon / CoreML
+                'MPSExecutionProvider',    # Mac Metal (newer versions of ORT)
+                'CPUExecutionProvider'
+            ]
             # Remove providers that aren't available
             if ort is not None:  # Type guard: ort is available if we got here
                 available_providers = ort.get_available_providers()

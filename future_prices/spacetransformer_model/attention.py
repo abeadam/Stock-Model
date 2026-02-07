@@ -16,6 +16,8 @@ import warnings
 from torch.utils.checkpoint import checkpoint
 from typing import Optional
 
+from .utils import empty_cache, synchronize
+
 # Suppress TracerWarnings during torch.compile() - these are safe for inference
 # The warnings occur when converting tensor values to Python types in checkpoint functions
 warnings.filterwarnings('ignore', message='.*TracerWarning.*')
@@ -132,42 +134,53 @@ def _check_and_clear_gpu_memory(
         print_progress: Whether to print progress messages (default: True)
     """
     should_clear_cache = False
-    if device.type == 'cuda' and total_memory is not None:
-        reserved = torch.cuda.memory_reserved(device)
-        memory_usage = reserved / total_memory  # Use reserved as it's what matters for OOM
-        
+    
+    if total_memory is not None:
+        if device.type == 'cuda':
+            reserved = torch.cuda.memory_reserved(device)
+            memory_usage = reserved / total_memory
+        elif device.type == 'mps':
+            # MPS memory management is handled by the OS
+            # but we can get currently allocated memory
+            if hasattr(torch, 'mps') and hasattr(torch.mps, 'current_allocated_memory'):
+                allocated = torch.mps.current_allocated_memory()
+                memory_usage = allocated / total_memory
+            else:
+                memory_usage = 0.0
+        else:
+            memory_usage = 0.0
+            
         # Clear cache if memory usage exceeds threshold
         if memory_usage > memory_threshold:
             should_clear_cache = True
             if print_progress:
                 progress_pct = ((i + 1) / seq_len) * 100
                 print(f"      Windowed attention: [{i + 1}/{seq_len}] ({progress_pct:.1f}%) | "
-                      f"GPU Memory: {memory_usage*100:.1f}% ({reserved/1e9:.2f}GB/{total_memory/1e9:.2f}GB) - Clearing cache", end='\r')
+                      f"{device.type.upper()} Memory: {memory_usage*100:.1f}% - Clearing cache", end='\r')
     
     # Print progress periodically (every 10 iterations) regardless of memory
-    if print_progress and iteration % 10 == 0 and device.type == 'cuda':
-        progress_pct = ((i + 1) / seq_len) * 100
-        if not should_clear_cache:  # Only print if we didn't already print above
-            if total_memory is not None:
-                reserved = torch.cuda.memory_reserved(device)
-                memory_usage = reserved / total_memory
-                print(f"      Windowed attention: [{i + 1}/{seq_len}] ({progress_pct:.1f}%) | "
-                      f"GPU Memory: {memory_usage*100:.1f}%", end='\r')
-            else:
-                print(f"      Windowed attention: [{i + 1}/{seq_len}] ({progress_pct:.1f}%)", end='\r')
+    if print_progress and iteration % 10 == 0:
+        if device.type in ['cuda', 'mps']:
+            progress_pct = ((i + 1) / seq_len) * 100
+            if not should_clear_cache:
+                if total_memory is not None:
+                    print(f"      Windowed attention: [{i + 1}/{seq_len}] ({progress_pct:.1f}%) | "
+                          f"{device.type.upper()} Memory: {memory_usage*100:.1f}%", end='\r')
+                else:
+                    print(f"      Windowed attention: [{i + 1}/{seq_len}] ({progress_pct:.1f}%)", end='\r')
     
     # Only synchronize and clear cache when memory is actually getting full
     if should_clear_cache:
-        torch.cuda.empty_cache()
+        empty_cache(device)
         gc.collect()  # Force Python garbage collection
-        torch.cuda.synchronize()  # Ensure operations complete before clearing
+        synchronize(device)  # Ensure operations complete before clearing
         
-        # Debug: Print all CUDA tensors to identify memory leaks
-        print(f"\n      DEBUG: CUDA Tensors after cache clear (iteration {i+1}):")
+        # Debug: Print all GPU tensors to identify memory leaks
+        print(f"\n      DEBUG: {device.type.upper()} Tensors after cache clear (iteration {i+1}):")
         tensor_count = 0
         total_memory_mb = 0.0
         for obj in gc.get_objects():
-            if torch.is_tensor(obj) and obj.is_cuda:
+            if torch.is_tensor(obj) and obj.device.type == device.type:
                 tensor_count += 1
                 obj_id = id(obj)
                 obj_size_bytes = obj.element_size() * obj.nelement()

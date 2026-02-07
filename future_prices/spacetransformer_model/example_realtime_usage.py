@@ -123,7 +123,6 @@ def example_with_real_data():
     
     try:
         from spacetransformer_model.data_loader import load_data
-        from spacetransformer_model.utils import extract_cyclical_time_features
         import pandas as pd
         
         checkpoint_path = get_checkpoint_path()

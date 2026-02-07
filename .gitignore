@@ -29,3 +29,6 @@ Thumbs.db
 future_prices/es_with_indicators.csv
 ./venv
 future_prices/es_with_indicators.csv
+
+# Daily data (root-level)
+daily_data/

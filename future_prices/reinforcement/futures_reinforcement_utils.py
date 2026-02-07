@@ -19,14 +19,20 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.distributions import Categorical
-from typing import Tuple, Optional, Dict, List
+from typing import Tuple, Optional, Dict, List, cast
 from collections import deque
 import random
+import pickle
 from sklearn.preprocessing import StandardScaler
 
 # Import the model class from the futures model file
 import sys
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# Add parent and MVE_SSNs_model directories to path for imports
+script_dir = os.path.dirname(os.path.abspath(__file__))
+parent_dir = os.path.dirname(script_dir)
+sys.path.insert(0, script_dir)
+sys.path.insert(0, parent_dir)
+sys.path.insert(0, os.path.join(parent_dir, 'MVE_SSNs_model'))
 from futures_model_MVE_SNNs import MVEModel
 
 # Import agents (will be imported at runtime to avoid circular dependencies)
@@ -53,24 +59,34 @@ class SPXTradingEnv:
     Reward: Profit/loss from trading minus transaction costs ($2.5 per contract)
     """
     
-    def __init__(self, data_path: str, model_path: str, device: str = 'cpu',
+    def __init__(self, data_path: str, model_path: Optional[str] = None, device: str = 'cpu',
                  max_steps_per_episode: int = 5000, max_loss_per_episode: float = -50000.0,
                  stop_loss_per_contract: float = 750.0,  # Increased from 500.0 to 750.0 - less aggressive 
                  variance_adaptive_risk: bool = True,
-                 variance_risk_sensitivity: float = 0.5):
+                 variance_risk_sensitivity: float = 0.5,
+                 max_position: int = 2,
+                 scaler_path: Optional[str] = None,
+                 max_rows: Optional[int] = None,
+                 random_start_in_file: bool = False):
         """
         Initialize the trading environment
-        
+
         Args:
             data_path: Path to es_with_indicators.csv
-            model_path: Path to futures_model.pt
+            model_path: Path to futures_model.pt (optional)
             device: Device to run model on ('cpu' or 'cuda')
             max_steps_per_episode: Maximum steps per episode (default: 5000, was unlimited)
             max_loss_per_episode: Maximum loss before early termination (default: -$50k)
             stop_loss_per_contract: Base stop loss threshold per contract (default: $500)
             variance_adaptive_risk: If True, adjust stop-loss based on predicted variance (default: True)
+                                   Note: requires model_path to be provided.
             variance_risk_sensitivity: How much variance affects risk (0.0-1.0, default: 0.5)
                                     Higher = more aggressive adjustment based on variance
+            max_position: Maximum number of contracts to hold (long or short, default: 2)
+            scaler_path: Optional path to save/load feature scaler (ensures consistency)
+            max_rows: Optional limit on number of rows to load (useful for quick testing, default: None = no limit)
+            random_start_in_file: If True and max_rows is set, load a random max_rows-sized window from the
+                                 file instead of the first max_rows rows. Ignored when max_rows is None.
         """
         self.device = device
         self.data_path = data_path
@@ -78,17 +94,53 @@ class SPXTradingEnv:
         self.max_steps_per_episode = max_steps_per_episode
         self.max_loss_per_episode = max_loss_per_episode
         self.base_stop_loss_per_contract = stop_loss_per_contract
-        self.variance_adaptive_risk = variance_adaptive_risk
+        self.variance_adaptive_risk = variance_adaptive_risk and model_path is not None
         self.variance_risk_sensitivity = variance_risk_sensitivity
+        self.max_position = max_position
+        self.min_position = -max_position
+        
+        # Determine scaler path if not provided
+        if scaler_path is None:
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            results_dir = os.path.join(script_dir, 'reinforcement_results')
+            os.makedirs(results_dir, exist_ok=True)
+            self.scaler_path = os.path.join(results_dir, 'feature_scaler.pkl')
+        else:
+            self.scaler_path = scaler_path
         
         # Track current variance predictions for adaptive risk
         self.current_pred_std_high = 0.0
         self.current_pred_std_low = 0.0
         self.current_stop_loss_per_contract = stop_loss_per_contract
         
+        # Training progress tracking (for decaying penalties)
+        self.training_progress = 0.0
+        
         # Load data
         print(f"Loading data from {data_path}...")
-        self.df = pd.read_csv(data_path)
+        # For quick tests, avoid reading the full CSV: use nrows to limit IO.
+        if max_rows is not None and max_rows > 0:
+            if random_start_in_file:
+                with open(data_path, 'r') as f:
+                    total_lines = sum(1 for _ in f)
+                total_data = max(0, total_lines - 1)  # subtract header
+                if total_data <= max_rows:
+                    self.df = pd.read_csv(data_path, nrows=max_rows)
+                    print(f"Loaded up to {max_rows} rows (file has {total_data} data rows)")
+                else:
+                    skip = random.randint(0, total_data - max_rows)
+                    # skiprows (callable): 0=header; skip data rows 1..skip, then read nrows
+                    self.df = pd.read_csv(
+                        data_path,
+                        skiprows=lambda x: 1 <= cast(int, x) <= skip,
+                        nrows=max_rows,
+                    )
+                    print(f"Loaded {max_rows} rows starting at file row {skip + 1} (random window)")
+            else:
+                self.df = pd.read_csv(data_path, nrows=max_rows)
+                print(f"Loaded up to {max_rows} rows for quick testing (using pandas nrows)")
+        else:
+            self.df = pd.read_csv(data_path)
         
         # Ensure we have required columns
         required_cols = ['Open', 'High', 'Low', 'Close', 'Volume']
@@ -100,44 +152,49 @@ class SPXTradingEnv:
         self.df = self.df.dropna(subset=required_cols).reset_index(drop=True)
         print(f"Loaded {len(self.df)} rows (removed {initial_len - len(self.df)} rows with NaN)")
         
-        # Load the pre-trained model
-        print(f"Loading model from {model_path}...")
-        checkpoint = torch.load(model_path, map_location=device, weights_only=False)
-        
-        # Reconstruct model
-        self.input_dim = checkpoint['input_dim']
-        self.hidden_dims = checkpoint['hidden_dims']
-        self.scaler = checkpoint['scaler']
-        self.feature_names = checkpoint['feature_names']
-        
-        # Determine if model predicts both high and low
-        # Check if model has quantile heads (predict_both=True)
-        state_dict_keys = list(checkpoint['model_state_dict'].keys())
-        self.predict_both = any('quantile_10_head' in key for key in state_dict_keys)
-        
-        # Create model instance
-        self.model = MVEModel(
-            input_dim=self.input_dim,
-            hidden_dims=self.hidden_dims,
-            dropout_rate=0.0,
-            predict_both=self.predict_both
-        )
-        self.model.load_state_dict(checkpoint['model_state_dict'])
-        self.model.to(device)
-        self.model.eval()
-        
-        # Compile model for faster inference (PyTorch 2.0+)
-        try:
-            self.model = torch.compile(self.model, mode='reduce-overhead')
-            print(f"Model compiled for faster inference")
-        except Exception as e:
-            print(f"Model compilation not available (PyTorch < 2.0 or error: {e}), using standard model")
-        
-        print(f"Model loaded. predict_both={self.predict_both}, input_dim={self.input_dim}")
+        # Load the pre-trained model (if provided)
+        if model_path is not None:
+            print(f"Loading model from {model_path}...")
+            checkpoint = torch.load(model_path, map_location=device, weights_only=False)
+            
+            # Reconstruct model
+            self.input_dim = checkpoint['input_dim']
+            self.hidden_dims = checkpoint['hidden_dims']
+            self.scaler = checkpoint['scaler']
+            self.feature_names = checkpoint['feature_names']
+            
+            # Determine if model predicts both high and low
+            # Check if model has quantile heads (predict_both=True)
+            state_dict_keys = list(checkpoint['model_state_dict'].keys())
+            self.predict_both = any('quantile_10_head' in key for key in state_dict_keys)
+            
+            # Create model instance
+            self.model = MVEModel(
+                input_dim=self.input_dim,
+                hidden_dims=self.hidden_dims,
+                dropout_rate=0.0,
+                predict_both=self.predict_both
+            )
+            self.model.load_state_dict(checkpoint['model_state_dict'])
+            self.model.to(device)
+            self.model.eval()
+            
+            # Compile model for faster inference (PyTorch 2.0+)
+            try:
+                self.model = torch.compile(self.model, mode='reduce-overhead')
+                print(f"Model compiled for faster inference")
+            except Exception as e:
+                print(f"Model compilation not available (PyTorch < 2.0 or error: {e}), using standard model")
+            
+            print(f"Model loaded. predict_both={self.predict_both}, input_dim={self.input_dim}")
+        else:
+            print("No prediction model provided. RL will learn directly from raw data.")
+            self.model = None
+            self.scaler = None
+            self.feature_names = []
+            self.predict_both = False
         
         # Trading parameters
-        self.max_position = 2  # Maximum position (long or short)
-        self.min_position = -2  # Minimum position (short)
         self.initial_position = 0
         self.transaction_cost_per_contract = 2.5  # $2.5 per futures contract
         self.trade_penalty_per_contract = 0.0  # Removed - was discouraging all trading
@@ -149,7 +206,7 @@ class SPXTradingEnv:
         self.peak_pnl = 0.0  # Track peak P&L for drawdown calculation
         
         # Normalize stop_loss for state representation (typical range: 100-1000)
-        self.stop_loss_normalized = (self.stop_loss_per_contract - 100.0) / 900.0  # Normalize to [0, 1] for 100-1000 range
+        # self.stop_loss_normalized = (self.stop_loss_per_contract - 100.0) / 900.0  # Normalize to [0, 1] for 100-1000 range
         
         # Identify columns that don't depend on future data
         # Exclude forward-looking columns: PctChange_ToMaxHigh_5, PctChange_ToMinLow_5
@@ -158,26 +215,59 @@ class SPXTradingEnv:
         exclude_cols = ['Date', 'DateTime', 'DateTime_ET'] + forward_looking_cols
         
         # Get all feature columns (non-forward-looking)
-        self.feature_cols = [col for col in self.df.columns 
-                            if col not in exclude_cols]
-        
+        # self.feature_cols = [col for col in self.df.columns 
+        #                     if col not in exclude_cols]
+        self.feature_cols = ['Open', 'High', 'Low', 'Close', 'Volume', 'hour_sin', 'hour_cos', 'day_sin', 'day_cos', 'month_sin', 'month_cos',
+        'BB_20_MA', 'BB_20_2_Upper', 'BB_20_2_Lower', 'MFI_14', 'RSI_14',
+        'BB_20_1_Upper', 'BB_20_1_Lower', 'BB_20_3_Upper', 'BB_20_3_Lower', 'BB_50_MA', 'BB_50_2_Upper', 'BB_50_2_Lower', 'BB_50_1_Upper', 'BB_50_1_Lower', 
+        'BB_50_3_Upper', 'BB_50_3_Lower', 'BB_10_MA', 'BB_10_2_Upper', 'BB_10_2_Lower', 'BB_10_1_Upper', 'BB_10_1_Lower', 'BB_10_3_Upper', 'BB_10_3_Lower',
+        'EMA_10', 'EMA_20', 'EMA_50', 'BB_10_STD', 'BB_20_STD', 'BB_50_STD', 'VXM_Open', 'VXM_High', 'VXM_Low', 'VXM_Close', 'VXM_Volume', 'VXM_BB_10_MA', 
+        'VXM_BB_10_STD', 'VXM_BB_10_1_Upper', 'VXM_BB_10_1_Lower', 'VXM_BB_10_2_Upper', 'VXM_BB_10_2_Lower', 'VXM_BB_10_3_Upper', 'VXM_BB_10_3_Lower',
+        'VXM_BB_20_MA', 'VXM_BB_20_STD', 'VXM_BB_20_1_Upper', 'VXM_BB_20_1_Lower', 'VXM_BB_20_2_Upper', 'VXM_BB_20_2_Lower', 'VXM_BB_20_3_Upper', 'VXM_BB_20_3_Lower',
+        'VXM_BB_50_MA', 'VXM_BB_50_STD', 'VXM_BB_50_1_Upper', 'VXM_BB_50_1_Lower', 'VXM_BB_50_2_Upper', 'VXM_BB_50_2_Lower', 'VXM_BB_50_3_Upper', 'VXM_BB_50_3_Lower',
+        'VXM_EMA_10', 'VXM_EMA_20', 'VXM_EMA_50', 'ATR_14', 'Hours_From_Formal_Trading', 'Hours_From_Overnight_Trading']
         print(f"Using {len(self.feature_cols)} non-forward-looking features for state")
         print(f"Excluded columns: {exclude_cols}")
         
-        # Create scaler for all features
+        # Create or load scaler for all features
         # Remove rows with NaN in feature columns for fitting scaler
         feature_data = self.df[self.feature_cols].copy()
         # Fill NaN with 0 for features (some indicators may have NaN at start)
         feature_data = feature_data.fillna(0)
+        
         self.feature_scaler = StandardScaler()
-        self.feature_scaler.fit(feature_data.values)
         
-        print(f"Feature scaler fitted on {len(feature_data)} samples")
+        if os.path.exists(self.scaler_path):
+            print(f"Loading feature scaler from {self.scaler_path}...")
+            try:
+                with open(self.scaler_path, 'rb') as f:
+                    self.feature_scaler = pickle.load(f)
+                print(f"✓ Feature scaler loaded successfully")
+            except Exception as e:
+                print(f"⚠️ Error loading scaler from {self.scaler_path}: {e}")
+                print(f"Fitting new scaler instead...")
+                self.feature_scaler.fit(feature_data.values)
+                # Save the newly fitted scaler
+                try:
+                    with open(self.scaler_path, 'wb') as f:
+                        pickle.dump(self.feature_scaler, f)
+                except:
+                    pass
+        else:
+            print(f"No scaler found at {self.scaler_path}. Fitting new scaler...")
+            self.feature_scaler.fit(feature_data.values)
+            # Save the newly fitted scaler
+            try:
+                with open(self.scaler_path, 'wb') as f:
+                    pickle.dump(self.feature_scaler, f)
+                print(f"✓ Saved new feature scaler to {self.scaler_path}")
+            except Exception as e:
+                print(f"⚠️ Could not save scaler to {self.scaler_path}: {e}")
         
-        # Action space: net change in position from -2 to +2
-        # Actions: -2, -1, 0, 1, 2 (sell 2, sell 1, hold, buy 1, buy 2)
-        self.action_space_size = 5
-        self.action_map = {-2: -2, -1: -1, 0: 0, 1: 1, 2: 2}
+        # Action space: net change in position from -max_position to +max_position
+        # Actions: 0 to 2*max_position (maps to -max_position to +max_position)
+        self.action_space_size = 2 * self.max_position + 1
+        # No mapping dictionary needed anymore, we'll calculate it in step()
         
         # Episode tracking
         self.step_count = 0
@@ -186,6 +276,29 @@ class SPXTradingEnv:
         # Reset environment
         self.reset()
     
+    def set_training_progress(self, progress: float):
+        """
+        Set training progress (0.0 to 1.0) to decay penalties
+        """
+        self.training_progress = max(0.0, min(1.0, progress))
+    
+    def set_feature_scaler(self, scaler):
+        """
+        Set the feature scaler from an external source (e.g., loaded from checkpoint)
+        Also saves it to feature_scaler.pkl for consistency
+        
+        Args:
+            scaler: StandardScaler instance
+        """
+        self.feature_scaler = scaler
+        # Save to file for consistency
+        try:
+            with open(self.scaler_path, 'wb') as f:
+                pickle.dump(self.feature_scaler, f)
+            print(f"✓ Set feature scaler and saved to {self.scaler_path}")
+        except Exception as e:
+            print(f"⚠️ Could not save feature scaler to {self.scaler_path}: {e}")
+
     def reset(self) -> np.ndarray:
         """
         Reset the environment to initial state
@@ -197,10 +310,20 @@ class SPXTradingEnv:
         # Ensure we have enough room for max_steps_per_episode
         max_start = max(1, len(self.df) - self.max_steps_per_episode - 2)
         self.current_step = random.randint(1, max_start)
+        
+        # Reset state variables
         self.position = self.initial_position
         self.cash = 0.0  # Track cash (negative means we owe money)
         self.total_pnl = 0.0
-        self.avg_entry_price = 0.0  # Average entry price for current position
+        self.step_count = 0
+        self.episode_start_pnl = 0.0
+        
+        # FIX: Set initial entry price to current market price to avoid "phantom P&L"
+        if self.position != 0:
+            self.avg_entry_price = self.df.iloc[self.current_step]['Close']
+        else:
+            self.avg_entry_price = 0.0
+            
         self.position_value = 0.0  # Value of current position
         self.peak_pnl = 0.0  # Track peak P&L for drawdown calculation
         self.initial_pnl = 0.0  # Track starting P&L
@@ -210,6 +333,18 @@ class SPXTradingEnv:
         # Trade tracking for overtrading penalty
         self.trade_count = 0
         self.last_trade_step = -1000  # Initialize to far in the past
+
+        # Temporal state: in-episode history (no RNN needed)
+        self.steps_holding = 0          # Consecutive steps with same non-zero position
+        self.steps_since_last_trade = 0 # Steps since last position change (0 = just traded)
+        
+        # Drawdown tracking
+        self.max_drawdown_so_far = 0.0
+        self.prev_unrealized_pnl = 0.0
+        self.episode_transaction_cost = 0.0  # Track total transaction costs in episode
+        
+        # Reset stop loss to base value
+        self.current_stop_loss_per_contract = self.base_stop_loss_per_contract
         
         # Get initial state (use step 0 for previous step data)
         state = self._get_state()
@@ -223,7 +358,9 @@ class SPXTradingEnv:
         - Previous step's all non-forward-looking features (normalized)
         - Current position (normalized)
         - Model predictions: mean_high, std_high, mean_low, std_low
-          (if model predicts both, otherwise high and low use same values)
+          (if model is present)
+        - Current stop-loss threshold (normalized)
+        - Temporal: steps_holding [0,1], steps_since_last_trade [0,1], running_pnl ~[-2,2]
         """
         if self.current_step == 0:
             # Use current step if no previous step available
@@ -244,70 +381,80 @@ class SPXTradingEnv:
                 feature_values.append(float(val))
         
         # Normalize features
-        feature_array = np.array(feature_values).reshape(1, -1)
-        features_normalized = self.feature_scaler.transform(feature_array)[0]
+        feature_array = np.array(feature_values).reshape(1, -1)[0]
+        # features_normalized = self.feature_scaler.transform(feature_array)[0]
         
-        # Get model prediction using previous step's data
-        # Extract features that the model expects (from feature_names)
-        model_features = []
-        for feat_name in self.feature_names:
-            if feat_name in self.df.columns:
-                val = prev_row[feat_name]
-                if pd.isna(val):
-                    model_features.append(0.0)
+        # Get model prediction using previous step's data (if model is available)
+        model_outputs = []
+        if self.model is not None:
+            # Extract features that the model expects (from feature_names)
+            model_features = []
+            for feat_name in self.feature_names:
+                if feat_name in self.df.columns:
+                    val = prev_row[feat_name]
+                    if pd.isna(val):
+                        model_features.append(0.0)
+                    else:
+                        model_features.append(float(val))
                 else:
-                    model_features.append(float(val))
-            else:
-                model_features.append(0.0)
-        
-        model_features = np.array(model_features).reshape(1, -1)
-        model_features_scaled = self.scaler.transform(model_features)
-        
-        # Get prediction from model
-        with torch.no_grad():
-            # Keep tensor on device for faster computation
-            features_tensor = torch.FloatTensor(model_features_scaled).to(self.device)
-            model_output = self.model(features_tensor)
+                    model_features.append(0.0)
             
-            if self.predict_both:
-                (mean_high, mean_low), (log_var_high, log_var_low) = model_output
-                # Compute std on GPU (faster), then transfer once
-                pred_std_high = (log_var_high * 0.5).exp().cpu().numpy()[0, 0]  # exp(0.5*log_var) = sqrt(exp(log_var))
-                pred_std_low = (log_var_low * 0.5).exp().cpu().numpy()[0, 0]
-                # Transfer means
-                pred_mean_high = mean_high.cpu().numpy()[0, 0]
-                pred_mean_low = mean_low.cpu().numpy()[0, 0]
+            model_features = np.array(model_features).reshape(1, -1)
+            scaler = self.scaler
+            if scaler is not None:
+                model_features_scaled = scaler.transform(model_features)
             else:
-                mean_pred, log_var_pred = model_output
-                # Compute std on GPU (faster)
-                pred_std_high = (log_var_pred * 0.5).exp().cpu().numpy()[0, 0]
-                pred_mean_high = mean_pred.cpu().numpy()[0, 0]
-                # If model doesn't predict both, use same values for low
-                pred_mean_low = pred_mean_high
-                pred_std_low = pred_std_high
+                # Fallback: use unscaled features if scaler is not available
+                model_features_scaled = model_features
+            
+            # Get prediction from model
+            with torch.no_grad():
+                # Keep tensor on device for faster computation
+                features_tensor = torch.FloatTensor(model_features_scaled).to(self.device)
+                model_output = self.model(features_tensor)
+                
+                if self.predict_both:
+                    (mean_high, mean_low), (log_var_high, log_var_low) = model_output
+                    # Compute std on GPU (faster), then transfer once
+                    pred_std_high = (log_var_high * 0.5).exp().cpu().numpy()[0, 0]  # exp(0.5*log_var) = sqrt(exp(log_var))
+                    pred_std_low = (log_var_low * 0.5).exp().cpu().numpy()[0, 0]
+                    # Transfer means
+                    pred_mean_high = mean_high.cpu().numpy()[0, 0]
+                    pred_mean_low = mean_low.cpu().numpy()[0, 0]
+                else:
+                    mean_pred, log_var_pred = model_output
+                    # Compute std on GPU (faster)
+                    pred_std_high = (log_var_pred * 0.5).exp().cpu().numpy()[0, 0]
+                    pred_mean_high = mean_pred.cpu().numpy()[0, 0]
+                    # If model doesn't predict both, use same values for low
+                    pred_mean_low = pred_mean_high
+                    pred_std_low = pred_std_high
+            
+            # Store current variance predictions for adaptive risk control
+            self.current_pred_std_high = pred_std_high
+            self.current_pred_std_low = pred_std_low
+            model_outputs = [pred_mean_high, pred_std_high, pred_mean_low, pred_std_low]
+        else:
+            # If no model, we don't have predictions or variance
+            self.current_pred_std_high = 0.0
+            self.current_pred_std_low = 0.0
+            model_outputs = []
         
-        # Store current variance predictions for adaptive risk control
-        self.current_pred_std_high = pred_std_high
-        self.current_pred_std_low = pred_std_low
-        
-        # Calculate adaptive stop-loss based on predicted variance
-        if self.variance_adaptive_risk:
+        # Calculate adaptive stop-loss based on predicted variance (only if model is present)
+        if self.variance_adaptive_risk and self.model is not None:
             # Higher variance (uncertainty) = tighter stop-loss (more conservative)
             # Lower variance (confidence) = looser stop-loss (more aggressive)
             # Use the maximum of high/low variance to be conservative
-            max_pred_std = max(abs(pred_std_high), abs(pred_std_low))
+            max_pred_std = max(abs(self.current_pred_std_high), abs(self.current_pred_std_low))
             
             # Normalize variance to a scale factor (0.5 to 2.0)
             # Typical std values are in range 0.001-0.1 (percentage changes)
-            # Map to risk adjustment: low std (0.001) → 1.5x (looser), high std (0.1) → 0.5x (tighter)
-            # Using exponential mapping for smooth adjustment
             if max_pred_std < 0.001:
                 variance_factor = 1.5  # Very confident: allow larger losses
             elif max_pred_std > 0.1:
                 variance_factor = 0.5  # Very uncertain: tighten stop-loss
             else:
                 # Linear interpolation between 0.001 and 0.1
-                # At 0.001: factor = 1.5, at 0.1: factor = 0.5
                 normalized_std = (max_pred_std - 0.001) / (0.1 - 0.001)
                 variance_factor = 1.5 - (1.5 - 0.5) * normalized_std
             
@@ -324,20 +471,43 @@ class SPXTradingEnv:
         position_normalized = self.position / self.max_position
         
         # Update stop_loss_normalized (using current adaptive stop-loss)
-        self.stop_loss_normalized = (self.current_stop_loss_per_contract - 100.0) / 900.0  # Normalize to [0, 1] for 100-1000 range
+        # self.stop_loss_normalized = (self.current_stop_loss_per_contract - 100.0) / 900.0  # Normalize to [0, 1] for 100-1000 range
         
-        # Combine state: [all_features, position, pred_mean_high, pred_std_high, pred_mean_low, pred_std_low, stop_loss]
-        # This gives the agent information about both expected high and low price movements
+        # Combine state: [all_features, position, [predictions], stop_loss]
+        # This gives the agent information about both expected high and low price movements (if available)
         # AND the current stop-loss threshold (so it can learn to adapt to different risk levels)
-        state = np.concatenate([
-            features_normalized,  # All non-forward-looking features
+        state_components = [
+            feature_array,  # All non-forward-looking features
             [position_normalized],  # 1 value
-            [pred_mean_high],  # 1 value - expected high price movement
-            [pred_std_high],  # 1 value - uncertainty in high prediction
-            [pred_mean_low],  # 1 value - expected low price movement
-            [pred_std_low],  # 1 value - uncertainty in low prediction
-            [self.stop_loss_normalized]  # 1 value - current stop-loss threshold (normalized)
-        ])
+        ]
+        
+        # Add model predictions if available
+        if model_outputs:
+            state_components.append(model_outputs)
+            
+        # Add stop-loss
+        # state_components.append([self.stop_loss_normalized])
+        state_components.append([self.current_stop_loss_per_contract])
+
+        # Temporal state: in-episode history (no RNN needed)
+        # - steps_holding: how long we've held the current position [0,1]
+        # - steps_since_last_trade: steps since last position change [0,1]
+        # - running_pnl: total_pnl + unrealized, normalized to ~[-2,2] ($±10k)
+        if self.position != 0 and self.avg_entry_price != 0:
+            current_price = self.df.iloc[self.current_step]['Close']
+            if self.position > 0:
+                _unreal = (current_price - self.avg_entry_price) * self.position * 50.0
+            else:
+                _unreal = (self.avg_entry_price - current_price) * abs(self.position) * 50.0
+        else:
+            _unreal = 0.0
+        running_pnl = self.total_pnl + _unreal
+        steps_holding_norm = min(1.0, self.steps_holding / self.max_steps_per_episode)
+        steps_since_last_trade_norm = min(1.0, self.steps_since_last_trade / self.max_steps_per_episode)
+        running_pnl_norm = float(np.clip(running_pnl / 5000.0, -2.0, 2.0))
+        state_components.append([steps_holding_norm, steps_since_last_trade_norm, running_pnl_norm])
+        
+        state = np.concatenate(state_components)
         
         return state.astype(np.float32)
     
@@ -368,18 +538,14 @@ class SPXTradingEnv:
             # If not, this multiplies on base stop-loss
             self.current_stop_loss_per_contract = self.current_stop_loss_per_contract * risk_multiplier
             # Clamp to reasonable range (100-1000)
-            self.current_stop_loss_per_contract = max(100.0, min(1000.0, self.current_stop_loss_per_contract))
+            # self.current_stop_loss_per_contract = max(100.0, min(1000.0, self.current_stop_loss_per_contract))
         
         # Map action to position change
-        position_change = self.action_map[action - 2]  # action: 0->-2, 1->-1, 2->0, 3->1, 4->2
+        # action 0 -> -max_position, ..., action max_position -> 0, ..., action 2*max_position -> +max_position
+        position_change = action - self.max_position
         
-        # Prevent actions that would exceed position limits
-        if self.position <= self.min_position and position_change < 0:
-            # Already at minimum position; cannot sell more
-            position_change = 0
-        elif self.position >= self.max_position and position_change > 0:
-            # Already at maximum position; cannot buy more
-            position_change = 0
+        # Get current price (use Close price for execution)
+        current_price = self.df.iloc[self.current_step]['Close']
         
         # Calculate new position
         new_position = self.position + position_change
@@ -388,22 +554,37 @@ class SPXTradingEnv:
         new_position = max(self.min_position, min(self.max_position, new_position))
         actual_change = new_position - self.position
         
-        # Get current price (use Close price for execution)
-        current_price = self.df.iloc[self.current_step]['Close']
-        
         # Calculate transaction cost: $2.5 per contract traded
         contracts_traded = abs(actual_change)
         transaction_cost = contracts_traded * self.transaction_cost_per_contract
+        self.episode_transaction_cost += transaction_cost
         
-        # Calculate reward (profit/loss)
+        # Get prices for market-based reward
+        # Ensure we have a previous step price
+        if self.current_step > 0:
+            price_prev = self.df.iloc[self.current_step - 1]['Close']
+        else:
+            price_prev = current_price
+            
+        # 1. Market Reward: money made/lost by the position held during the last step
+        # This is the "true" journey reward that sums to final P&L
+        market_reward = self.position * (current_price - price_prev) * 50.0
+        
+        # Initialize reward: Reward is purely P&L-based (no penalties)
+        # The risk multiplier learns naturally through the P&L reward signal
         reward = 0.0
+        
+        # Add market reward (wealth change due to market movement)
+        # This tracks unrealized P&L changes step-by-step
+        reward += market_reward
+        
+        # Subtract transaction cost from this step's reward
+        reward -= transaction_cost
+        
+        # Update P&L and Position
         old_position = self.position
         
         # Calculate realized P&L from position change
-        # Store this for reward shaping (before position is updated)
-        profitable_trade = False
-        profit_amount = 0.0
-        
         if old_position != 0 and self.avg_entry_price != 0:
             # Realized P&L when reducing or reversing position
             if (old_position > 0 and actual_change < 0) or (old_position < 0 and actual_change > 0):
@@ -411,30 +592,32 @@ class SPXTradingEnv:
                 closed_units = min(abs(old_position), abs(actual_change))
                 if old_position > 0:
                     # Long position: profit when price goes up
-                    realized_pnl = (current_price - self.avg_entry_price) * closed_units
-                    pnl_per_contract = current_price - self.avg_entry_price
+                    realized_pnl = (current_price - self.avg_entry_price) * closed_units * 50.0
                 else:
                     # Short position: profit when price goes down
-                    realized_pnl = (self.avg_entry_price - current_price) * closed_units
-                    pnl_per_contract = self.avg_entry_price - current_price
+                    realized_pnl = (self.avg_entry_price - current_price) * closed_units * 50.0
                 
-                # Check if this is a profitable trade (before transaction costs)
-                if pnl_per_contract > 0:
-                    profitable_trade = True
-                    profit_amount = pnl_per_contract * closed_units
-                
+                # CRITICAL FIX: When closing a position, we need to adjust reward
+                # Market reward tracked unrealized P&L changes step-by-step, but now we're realizing P&L
+                # We need to: (1) remove market_reward contribution for closed units this step, (2) add realized P&L
+                # The market_reward for closed units this step uses the sign of old_position
+                # (old_position / abs(old_position)) gives +1 for long, -1 for short
+                market_reward_for_closed = (old_position / abs(old_position)) * closed_units * (current_price - price_prev) * 50.0
+                # Replace with realized P&L (which is already calculated correctly above)
+                reward -= market_reward_for_closed
                 reward += realized_pnl
+                
+                # Update total P&L (realized)
                 self.total_pnl += realized_pnl
         
-        # Apply transaction cost to reward
-        reward -= transaction_cost
+        # Apply transaction cost to total P&L
         self.total_pnl -= transaction_cost
         
         # Update average entry price and position
         if actual_change > 0:
             # Buying: reduce cash, add to position (or reduce short)
             cost = actual_change * current_price
-            self.cash -= cost
+            self.cash -= cost * 50.0
             
             if old_position == 0:
                 # Starting new long position
@@ -455,7 +638,7 @@ class SPXTradingEnv:
         elif actual_change < 0:
             # Selling: increase cash, reduce position (or go short)
             proceeds = abs(actual_change) * current_price
-            self.cash += proceeds
+            self.cash += proceeds * 50.0
             
             if old_position == 0:
                 # Starting new short position
@@ -476,15 +659,27 @@ class SPXTradingEnv:
         
         # Update position
         self.position = new_position
+
+        # Update temporal state (in-episode history)
+        if self.position == 0:
+            self.steps_holding = 0
+        elif actual_change != 0:
+            self.steps_holding = 1  # New or changed position
+        else:
+            self.steps_holding += 1
+        if actual_change != 0:
+            self.steps_since_last_trade = 0
+        else:
+            self.steps_since_last_trade += 1
         
         # Unrealized P&L (mark-to-market)
         if self.position != 0 and self.avg_entry_price != 0:
             if self.position > 0:
                 # Long position
-                unrealized_pnl = (current_price - self.avg_entry_price) * self.position
+                unrealized_pnl = (current_price - self.avg_entry_price) * self.position * 50.0
             else:
                 # Short position
-                unrealized_pnl = (self.avg_entry_price - current_price) * abs(self.position)
+                unrealized_pnl = (self.avg_entry_price - current_price) * abs(self.position) * 50.0
         else:
             unrealized_pnl = 0.0
         
@@ -509,77 +704,34 @@ class SPXTradingEnv:
             if unrealized_loss_per_contract > effective_stop_loss:
                 # Force close position at stop-loss
                 stop_loss_triggered = True
+                stop_loss_position = self.position  # Save position before reset
                 if self.position > 0:
-                    stop_loss_pnl = (current_price - self.avg_entry_price) * self.position
+                    stop_loss_pnl = (current_price - self.avg_entry_price) * self.position * 50.0
                 else:
-                    stop_loss_pnl = (self.avg_entry_price - current_price) * abs(self.position)
+                    stop_loss_pnl = (self.avg_entry_price - current_price) * abs(self.position) * 50.0
                 
                 # Apply transaction cost for closing
                 closing_cost = abs(self.position) * self.transaction_cost_per_contract
+                self.episode_transaction_cost += closing_cost
                 stop_loss_pnl -= closing_cost
                 
+                # CRITICAL FIX: Add stop-loss P&L to reward (it was missing!)
+                # Also need to remove the market_reward contribution for this position
+                # since we're now realizing the P&L instead of tracking unrealized
+                # stop_loss_position already has the correct sign (positive for long, negative for short)
+                market_reward_for_stop_loss = stop_loss_position * (current_price - price_prev) * 50.0
+                reward -= market_reward_for_stop_loss
                 reward += stop_loss_pnl
+                
                 self.total_pnl += stop_loss_pnl
                 
-                # Reset position
+                # Reset position and temporal state (close is a trade)
                 self.position = 0
                 self.avg_entry_price = 0.0
+                self.steps_holding = 0
+                self.steps_since_last_trade = 0
                 unrealized_pnl = 0.0
                 total_pnl_with_unrealized = self.total_pnl
-        
-        # RISK MANAGEMENT: Drawdown penalty
-        # Penalize large drawdowns to encourage risk management
-        if drawdown > 0:
-            # Penalty increases quadratically with drawdown
-            drawdown_penalty = -0.001 * (drawdown / 100.0) ** 2
-            reward += drawdown_penalty
-        
-        # RISK MANAGEMENT: Large loss penalty
-        # Strongly penalize episodes with large negative P&L
-        if total_pnl_with_unrealized < -1000.0:
-            large_loss_penalty = -0.01 * abs(total_pnl_with_unrealized) / 100.0
-            reward += large_loss_penalty
-        
-        # REWARD SHAPING: Encourage profitable trading
-        # 1. Bonus for profitable trades (when closing with profit)
-        if profitable_trade and profit_amount > 0:
-            # Profitable trade - add bonus proportional to profit
-            # This encourages the agent to take profits
-            profit_bonus = 0.10 * profit_amount / 100.0  # Increased from 0.05 to 0.10 - stronger incentive
-            reward += profit_bonus
-        
-        # 2. Hold bonus when position is profitable (encourage holding winners)
-        if self.position != 0 and unrealized_pnl > 0:
-            # Bonus for holding profitable positions
-            # This encourages the agent to let winners run
-            hold_bonus = 0.03 * unrealized_pnl / 100.0  # Increased from 0.01 to 0.03 - stronger incentive
-            reward += hold_bonus
-        
-        # 3. Overtrading penalty (discourage excessive trading)
-        # Track trading frequency - penalize if trading too frequently
-        if actual_change != 0:
-            self.trade_count += 1
-            steps_since_last_trade = self.step_count - self.last_trade_step
-            self.last_trade_step = self.step_count
-            
-            # Penalize if trading too frequently (within 5 steps)
-            if steps_since_last_trade < 5:
-                overtrading_penalty = -0.5 * (5 - steps_since_last_trade) / 5.0
-                reward += overtrading_penalty
-        
-        # Total reward: primarily based on realized P&L changes
-        # Add small unrealized P&L component for immediate feedback (reduced weight)
-        # Reward = change in total P&L (realized + small unrealized component) - transaction costs
-        reward += unrealized_pnl * 0.1  # Reduced from 0.5 - tighter coupling to actual P&L
-        
-        # Scale reward to prevent Q-value explosion (divide by 100 to normalize)
-        # SPX prices are typically 3000-5000, so P&L can be large
-        # Scale down to make Q-values more stable
-        reward = reward / 100.0
-        
-        # Clip reward to reasonable range for stability
-        # This prevents extreme rewards from destabilizing training
-        reward = np.clip(reward, -5.0, 5.0)
         
         # Move to next step
         self.current_step += 1
@@ -605,32 +757,71 @@ class SPXTradingEnv:
         if not done:
             next_state = self._get_state()
         else:
-            # Final state: close all positions
+            # Final state: close all positions and apply terminal rewards
             if self.position != 0:
-                final_price = self.df.iloc[-1]['Close']
+                final_price = self.df.iloc[self.current_step]['Close']
                 if self.avg_entry_price != 0:
                     # Calculate final P&L
                     if self.position > 0:
-                        # Long position
-                        final_pnl = (final_price - self.avg_entry_price) * self.position
+                        final_pnl = (final_price - self.avg_entry_price) * self.position * 50.0
                     else:
-                        # Short position
-                        final_pnl = (self.avg_entry_price - final_price) * abs(self.position)
+                        final_pnl = (self.avg_entry_price - final_price) * abs(self.position) * 50.0
+                    
+                    # CRITICAL FIX: Remove the last step's market_reward since we're now realizing the P&L
+                    # The market_reward for the last step was already added to reward at line 530,
+                    # but it only represents the price movement from price_prev to current_price.
+                    # We need to replace it with final_pnl which is the total profit from entry to exit.
+                    # market_reward = self.position * (current_price - price_prev) * 50.0 (already in reward)
+                    # Note: final_price == current_price at this point, but using current_price for consistency
+                    market_reward_for_last_step = self.position * (current_price - price_prev) * 50.0
+                    reward -= market_reward_for_last_step
+                    
+                    # Terminal Reward: Add final P&L to reward
+                    # The final_pnl represents the total profit/loss from entry to exit
+                    # This needs to be added to reward so it reflects the actual outcome
+                    reward += final_pnl
                     
                     # Apply transaction cost for closing position
                     closing_cost = abs(self.position) * self.transaction_cost_per_contract
-                    final_pnl -= closing_cost
-                    
-                    reward += final_pnl
+                    reward -= closing_cost  # Subtract closing cost from reward
+                    self.episode_transaction_cost += closing_cost
                     self.total_pnl += final_pnl
+                    
+                    # No terminal bonuses - reward is purely final_pnl - closing_cost
+                
                 self.position = 0
                 self.avg_entry_price = 0.0
                 self.position_value = 0.0
+                self.steps_holding = 0
+                self.steps_since_last_trade = 0
             
-            # Use last valid state
+            # Position closed (or was already 0), so unrealized_pnl is 0
+            unrealized_pnl = 0.0
+            
+            # Use last valid state (temporal vars already 0 from close or unchanged if was flat)
             next_state = self._get_state()
         
-        # total_pnl_with_unrealized already calculated above for risk management
+        # Scale reward to prevent value function explosion while maintaining signal strength
+        # Dividing by 100.0 converts dollar amounts to reward units
+        # Example: $100 P&L → 1.0 reward, $10,000 P&L → 100.0 reward
+        reward = reward / 100.0
+        
+        # Clip reward to prevent extreme values from destabilizing training
+        # Wide range allows model to distinguish between small wins and big wins
+        # Clipping at ±2000 means max reward is ±20.0 after scaling (for $200,000 moves)
+        # Increased from ±500 to better track large P&L swings without clipping
+        reward = np.clip(reward, -2000.0, 2000.0)
+
+        # Calculate total P&L with unrealized for logging and info dict
+        # Note: unrealized_pnl is either from earlier calculation (if done=False) or 0 (if done=True and position closed)
+            
+        total_pnl_with_unrealized = self.total_pnl + unrealized_pnl
+        
+        # Final drawdown and peak update
+        if total_pnl_with_unrealized > self.peak_pnl:
+            self.peak_pnl = total_pnl_with_unrealized
+        drawdown = self.peak_pnl - total_pnl_with_unrealized
+
         # Determine termination reason
         termination_reason = None
         if done:
@@ -655,6 +846,7 @@ class SPXTradingEnv:
             'unrealized_pnl': unrealized_pnl,
             'price': current_price,
             'transaction_cost': transaction_cost,
+            'cumulative_transaction_cost': self.episode_transaction_cost,
             'termination_reason': termination_reason,
             'drawdown': drawdown,
             'peak_pnl': self.peak_pnl,
@@ -695,11 +887,26 @@ def train_agent(env: SPXTradingEnv, agent, num_episodes: int = 1000,
         print(f"\nResuming training from episode {start_episode} for {num_episodes} more episodes...")
     else:
         print(f"\nStarting training for {num_episodes} episodes...")
+        # Clear the reinforcement_results folder for a fresh run
+        results_dir = os.path.join(os.path.dirname(__file__), 'reinforcement_results')
+        if os.path.exists(results_dir):
+            import shutil
+            for filename in os.listdir(results_dir):
+                file_path = os.path.join(results_dir, filename)
+                try:
+                    if os.path.isfile(file_path) or os.path.islink(file_path):
+                        os.unlink(file_path)
+                    elif os.path.isdir(file_path):
+                        shutil.rmtree(file_path)
+                except Exception as e:
+                    print(f'Failed to delete {file_path}. Reason: {e}')
+            print(f"🧹 Cleared {results_dir} for fresh training")
     print("=" * 80)
     print("\n🚀 IMPROVEMENTS IMPLEMENTED:")
     print(f"  ✓ Episodes limited to {env.max_steps_per_episode} steps (was unlimited)")
     print(f"  ✓ Early termination if loss exceeds ${env.max_loss_per_episode:.0f}")
-    print(f"  ✓ Reward function tightened (unrealized P&L weight: 0.1, clipped to [-5, 5])")
+    print(f"  ✓ Reward function optimized (unrealized P&L weight: 0.01, clipped to [-50, 50])")
+    print(f"  ✓ Position rotation: Penalties for sticking at max/min position")
     print(f"  ✓ Double DQN: Reduces overestimation bias")
     print(f"  ✓ Dueling DQN: Separates value and advantage estimation for better learning")
     print("=" * 80)
@@ -707,6 +914,9 @@ def train_agent(env: SPXTradingEnv, agent, num_episodes: int = 1000,
     episode_rewards = []
     episode_pnls = []
     episode_losses = []
+    episode_policy_losses = []
+    episode_value_losses = []
+    episode_entropies = []
     episode_steps = []
     episode_transaction_costs = []
     
@@ -743,10 +953,17 @@ def train_agent(env: SPXTradingEnv, agent, num_episodes: int = 1000,
     print(f"  LR scheduler: Step every 100k steps, decay by 2%")
     
     for episode in range(start_episode, start_episode + num_episodes):
+        # Update training progress for decaying penalties
+        total_expected_episodes = getattr(agent, 'total_episodes', start_episode + num_episodes)
+        env.set_training_progress(episode / total_expected_episodes)
+        
         state = env.reset()
         total_reward = 0.0
         steps = 0
         episode_loss = 0.0
+        episode_policy_loss = 0.0
+        episode_value_loss = 0.0
+        episode_entropy = 0.0
         loss_count = 0
         
         # Track detailed episode information
@@ -763,8 +980,8 @@ def train_agent(env: SPXTradingEnv, agent, num_episodes: int = 1000,
         while True:
             # Choose action
             if is_ppo:
-                action = agent.act(state, training=True)
-                risk_multiplier = None
+                # PPO act() now returns (action, risk_multiplier)
+                action, risk_multiplier = agent.act(state, training=True)
             elif is_dqn:
                 act_result = agent.act(state, training=True)
                 if isinstance(act_result, tuple):
@@ -806,43 +1023,88 @@ def train_agent(env: SPXTradingEnv, agent, num_episodes: int = 1000,
                             print(f"   Training steps: {agent.training_steps}")
                             continue
             elif is_ppo:
-                # PPO updates at end of episode or when buffer is full
-                # For now, we'll update at end of episode
-                pass
+                # PPO updates at end of episode or when we have enough samples (mid-episode update)
+                # Update whenever we have at least batch_size samples
+                buffer_size = len(agent.states)
+                if (buffer_size >= agent.batch_size and not done):
+                    # Mid-episode update: compute value estimate of current state for bootstrapping
+                    # This allows more frequent learning and better sample efficiency
+                    with torch.no_grad():
+                        state_tensor = torch.FloatTensor(next_state).unsqueeze(0).to(agent.device)
+                        _, value, _ = agent.actor_critic(state_tensor)
+                        bootstrap_value = value.item()
+                    
+                    # Update with bootstrap value (episode not done, so bootstrap from current state)
+                    loss_result = agent.update(terminal_value=bootstrap_value)
+                    if loss_result is not None:
+                        # Handle both dict (new format) and float (old format) for backward compatibility
+                        if isinstance(loss_result, dict):
+                            episode_loss += loss_result['total_loss']
+                            episode_policy_loss += loss_result['policy_loss']
+                            episode_value_loss += loss_result['value_loss']
+                            episode_entropy += loss_result['entropy']
+                        else:
+                            episode_loss += loss_result
+                        loss_count += 1
+                        # Check for NaN or inf loss
+                        loss_val = loss_result['total_loss'] if isinstance(loss_result, dict) else loss_result
+                        if not (np.isfinite(loss_val)):
+                            print(f"   ⚠️  Non-finite loss detected: {loss_val} at step {steps}")
+                            print(f"   Current LR: {agent.optimizer.param_groups[0]['lr']:.6f}")
+                            print(f"   Training steps: {agent.training_steps}")
+                        # Log mid-episode update (only occasionally to avoid spam)
+                        if agent.training_steps % 10 == 0:
+                            print(f"   🔄 Mid-episode update at step {steps} (buffer: {buffer_size} samples, training step: {agent.training_steps})")
+                    # Buffer is cleared inside update() after training
             
             state = next_state
             total_reward += reward
             steps += 1
-            
+
             if done:
+                if hasattr(agent, 'on_episode_end') and callable(agent.on_episode_end):
+                    agent.on_episode_end()
                 break
-        
+
         # PPO update at end of episode
         if is_ppo:
-            # Add terminal value estimate
-            with torch.no_grad():
-                state_tensor = torch.FloatTensor(state).unsqueeze(0).to(agent.device)
-                _, value = agent.actor_critic(state_tensor)
-                terminal_value = value.item() if not done else 0.0
+            # Terminal value estimate for GAE computation
+            # Since the loop only exits when done=True, terminal value is always 0.0
+            # (no future rewards after episode ends)
+            terminal_value = 0.0
             # Update with terminal value
+            # NOTE: Don't append to agent.values - compute_gae() will add next_value itself
+            # Pass terminal_value to update() which will pass it to compute_gae()
             if len(agent.states) > 0:
-                agent.values.append(terminal_value)
-                loss = agent.update()
-                if loss is not None:
-                    episode_loss = loss
-                    loss_count = 1
-                else:
-                    episode_loss = 0.0
-                    loss_count = 0
-            else:
-                episode_loss = 0.0
-                loss_count = 0
+                # Ensure last done flag is True (episode ended, so last step should be done=True)
+                if len(agent.dones) > 0:
+                    agent.dones[-1] = True
+                loss_result = agent.update(terminal_value=terminal_value)
+                if loss_result is not None:
+                    # Handle both dict (new format) and float (old format) for backward compatibility
+                    if isinstance(loss_result, dict):
+                        episode_loss += loss_result['total_loss']
+                        episode_policy_loss += loss_result['policy_loss']
+                        episode_value_loss += loss_result['value_loss']
+                        episode_entropy += loss_result['entropy']
+                    else:
+                        episode_loss += loss_result
+                    loss_count += 1
+                # If loss is None, keep existing episode_loss and loss_count from mid-episode updates
         
         avg_loss = episode_loss / loss_count if loss_count > 0 else 0.0
-        total_transaction_cost = sum(transaction_costs)
+        avg_policy_loss = episode_policy_loss / loss_count if loss_count > 0 else 0.0
+        avg_value_loss = episode_value_loss / loss_count if loss_count > 0 else 0.0
+        avg_entropy = episode_entropy / loss_count if loss_count > 0 else 0.0
+        total_transaction_cost = info.get('cumulative_transaction_cost', sum(transaction_costs))
         episode_rewards.append(total_reward)
-        episode_pnls.append(info['total_pnl'])
+        # Use total_pnl_with_unrealized to capture final position closure
+        final_total_pnl = info.get('total_pnl_with_unrealized', info['total_pnl'])
+        episode_pnls.append(final_total_pnl)
         episode_losses.append(avg_loss)
+        episode_policy_losses.append(avg_policy_loss)
+        episode_value_losses.append(avg_value_loss)
+        episode_entropies.append(avg_entropy)
         episode_steps.append(steps)
         episode_transaction_costs.append(total_transaction_cost)
         
@@ -922,7 +1184,7 @@ def train_agent(env: SPXTradingEnv, agent, num_episodes: int = 1000,
         print(f"    Termination:   {reason_str}")
         if stop_loss_triggered:
             print(f"    ⚠️  STOP-LOSS TRIGGERED: Position closed to limit losses")
-        print(f"    Note: Reward clipped to [-5, 5] and includes unrealized P&L * 0.1 for immediate feedback")
+        print(f"    Note: Reward clipped to [-2000, 2000] and optimized for Total P&L change")
         print(f"  Last {window} Episodes Average:")
         print(f"    Avg Reward:    {avg_reward:10.2f} | Avg P&L: {avg_pnl:10.2f} | Avg Loss: {np.mean(episode_losses[-window:]):8.4f}")
         print(f"    Avg Steps:     {avg_steps:10.1f} | Avg Txn Cost: ${avg_txn_cost:8.2f}")
@@ -935,7 +1197,22 @@ def train_agent(env: SPXTradingEnv, agent, num_episodes: int = 1000,
         
         # Action distribution
         print(f"\n🎯 ACTION DISTRIBUTION:")
-        action_names = {0: "Hold", 1: "Buy 1", 2: "Buy 2", 3: "Sell 1", 4: "Sell 2"}
+        # Dynamic action names based on environment's max_position
+        if hasattr(env, 'max_position'):
+            max_pos = env.max_position
+            action_names = {}
+            for a in range(env.action_space_size):
+                change = a - max_pos
+                if change == 0:
+                    action_names[a] = "Hold"
+                elif change > 0:
+                    action_names[a] = f"Buy {change}"
+                else:
+                    action_names[a] = f"Sell {abs(change)}"
+        else:
+            # Fallback for old 5-action space
+            action_names = {0: "Hold", 1: "Buy 1", 2: "Buy 2", 3: "Sell 1", 4: "Sell 2"}
+            
         for action_idx in sorted(action_counts.keys()):
             count = action_counts[action_idx]
             pct = (count / len(actions_taken)) * 100 if actions_taken else 0
@@ -1011,13 +1288,9 @@ def train_agent(env: SPXTradingEnv, agent, num_episodes: int = 1000,
                         print(f"      Epsilon: {old_epsilon:.4f} → {agent.epsilon:.4f}")
                         print(f"      This will help the agent explore more to escape the local minimum")
                 elif _is_ppo_agent(agent):
-                    # PPO uses entropy for exploration - increase entropy coefficient
-                    old_entropy = agent.entropy_coef
-                    agent.entropy_coef = min(0.1, agent.entropy_coef * 1.5)
-                    if agent.entropy_coef > old_entropy:
-                        print(f"   🔄 AUTO-BOOSTING EXPLORATION (PPO):")
-                        print(f"      Entropy Coef: {old_entropy:.4f} → {agent.entropy_coef:.4f}")
-                        print(f"      This will help the agent explore more to escape the local minimum")
+                    # PPO uses entropy for exploration - DO NOT auto-boost for trading envs
+                    # as random exploration leads to transaction cost suicide.
+                    pass
                 
                 print(f"   Other recommendations:")
                 print(f"     - Reducing learning rate")
@@ -1073,21 +1346,23 @@ def train_agent(env: SPXTradingEnv, agent, num_episodes: int = 1000,
                             print(f"      Epsilon: {old_epsilon:.4f} → {agent.epsilon:.4f}")
                             print(f"      This will help the agent explore more to find a better policy")
                     elif _is_ppo_agent(agent):
-                        # PPO uses entropy for exploration - increase entropy coefficient
-                        old_entropy = agent.entropy_coef
-                        agent.entropy_coef = min(0.1, agent.entropy_coef * 1.5)
-                        if agent.entropy_coef > old_entropy:
-                            print(f"   🔄 AUTO-BOOSTING EXPLORATION (PPO):")
-                            print(f"      Entropy Coef: {old_entropy:.4f} → {agent.entropy_coef:.4f}")
-                            print(f"      This will help the agent explore more to find a better policy")
+                        # PPO uses entropy for exploration - DO NOT auto-boost for trading envs
+                        # as random exploration leads to transaction cost suicide.
+                        pass
         if _is_dqn_agent(agent):
             maxlen = agent.memory.maxlen if agent.memory.maxlen is not None else len(agent.memory)
             pct_full = (len(agent.memory) / maxlen * 100) if maxlen > 0 else 0.0
             print(f"  Memory Buffer:  {len(agent.memory):5d}/{maxlen:5d} ({pct_full:.1f}% full)")
             print(f"  Training Steps: {loss_count:5d} (loss computed {loss_count} times)")
         elif _is_ppo_agent(agent):
-            print(f"  Trajectory Length: {len(agent.states):5d} steps")
-            print(f"  Training Steps: {loss_count:5d} (loss computed {loss_count} times)")
+            # Trajectory length is only populated during training (training=True)
+            # During evaluation, this will be 0, which is expected
+            trajectory_len = len(agent.states)
+            if trajectory_len == 0:
+                print(f"  Trajectory Length: {trajectory_len:5d} steps (evaluation mode - trajectories not stored)")
+            else:
+                print(f"  Trajectory Length: {trajectory_len:5d} steps")
+            print(f"  Training Steps: {loss_count:5d} (loss computed {loss_count} times this episode)")
         
         # Learning trend analysis
         if episode >= 9:  # Need at least 10 episodes to compare
@@ -1206,16 +1481,50 @@ def train_agent(env: SPXTradingEnv, agent, num_episodes: int = 1000,
                 print(f"   Stopping training at episode {episode + 1} (saved {episode + 1 - start_episode} episodes)")
                 
                 # Save final checkpoint before stopping
-                checkpoint_path = os.path.join(os.path.dirname(__file__), 'reinforcement_results', f'rl_agent_ep{episode + 1}.pt')
-                agent.save(checkpoint_path, episode=episode + 1)
-                print(f"   ✓ Saved checkpoint: {checkpoint_path}")
+                results_dir = os.path.join(os.path.dirname(__file__), 'reinforcement_results')
+                latest_path = os.path.join(results_dir, 'rl_agent_latest.pt')
+                ep_save_path = os.path.join(results_dir, f'rl_agent_ep{episode + 1}.pt')
+                
+                # Set feature scaler from environment before saving (for PPO agents)
+                if _is_ppo_agent(agent) and hasattr(env, 'feature_scaler'):
+                    agent.set_feature_scaler(env.feature_scaler)
+                
+                # Clean up previous episode checkpoints
+                for f in os.listdir(results_dir):
+                    if f.startswith('rl_agent_ep') and f.endswith('.pt'):
+                        try:
+                            os.remove(os.path.join(results_dir, f))
+                        except:
+                            pass
+                
+                agent.save(latest_path, episode=episode + 1)
+                agent.save(ep_save_path, episode=episode + 1)
+                print(f"   ✓ Saved final checkpoints: {latest_path} and {ep_save_path}")
                 break
         
         # Save agent
         if (episode + 1) % save_freq == 0:
-            save_path = os.path.join(os.path.dirname(__file__), 'reinforcement_results', f'rl_agent_ep{episode+1}.pt')
+            # Save as latest and also as the current episode to only keep latest 2
+            results_dir = os.path.join(os.path.dirname(__file__), 'reinforcement_results')
+            save_path = os.path.join(results_dir, f'rl_agent_latest.pt')
+            
+            # Set feature scaler from environment before saving (for PPO agents)
+            if _is_ppo_agent(agent) and hasattr(env, 'feature_scaler'):
+                agent.set_feature_scaler(env.feature_scaler)
             agent.save(save_path, episode=episode+1)
-            print(f"✓ Saved agent to {save_path}")
+            
+            # Also save with episode number but delete previous episode-numbered checkpoints
+            # to keep only the absolute latest and the last saved episode checkpoint
+            for f in os.listdir(results_dir):
+                if f.startswith('rl_agent_ep') and f.endswith('.pt'):
+                    try:
+                        os.remove(os.path.join(results_dir, f))
+                    except:
+                        pass
+            
+            ep_save_path = os.path.join(results_dir, f'rl_agent_ep{episode+1}.pt')
+            agent.save(ep_save_path, episode=episode+1)
+            print(f"✓ Saved agent to {ep_save_path} (and updated latest)")
     
     # Training summary with comprehensive analysis
     print(f"\n📊 TRAINING SUMMARY:")
@@ -1309,11 +1618,20 @@ def train_agent(env: SPXTradingEnv, agent, num_episodes: int = 1000,
             
             f.write("EPISODE-BY-EPISODE P&L TRENDS\n")
             f.write("-" * 100 + "\n")
-            f.write(f"{'Episode':<10} {'P&L':<15} {'Reward':<15} {'Loss':<15} {'Steps':<10}\n")
-            f.write("-" * 100 + "\n")
-            
-            for i, (pnl, reward, loss, steps) in enumerate(zip(episode_pnls, episode_rewards, episode_losses, episode_steps)):
-                f.write(f"{start_episode + i:<10} ${pnl:<14.2f} {reward:<15.2f} {loss:<15.6f} {steps:<10}\n")
+            # Check if we have loss components (PPO) or just total loss (DQN)
+            if len(episode_policy_losses) > 0 and len(episode_policy_losses) == len(episode_losses):
+                f.write(f"{'Episode':<10} {'P&L':<15} {'Reward':<15} {'Loss':<15} {'Policy':<12} {'Value':<12} {'Entropy':<12} {'Steps':<10}\n")
+                f.write("-" * 100 + "\n")
+                for i, (pnl, reward, loss, policy_loss, value_loss, entropy, steps) in enumerate(
+                    zip(episode_pnls, episode_rewards, episode_losses, episode_policy_losses, 
+                        episode_value_losses, episode_entropies, episode_steps)):
+                    f.write(f"{start_episode + i:<10} ${pnl:<14.2f} {reward:<15.2f} {loss:<15.6f} "
+                           f"{policy_loss:<12.6f} {value_loss:<12.6f} {entropy:<12.6f} {steps:<10}\n")
+            else:
+                f.write(f"{'Episode':<10} {'P&L':<15} {'Reward':<15} {'Loss':<15} {'Steps':<10}\n")
+                f.write("-" * 100 + "\n")
+                for i, (pnl, reward, loss, steps) in enumerate(zip(episode_pnls, episode_rewards, episode_losses, episode_steps)):
+                    f.write(f"{start_episode + i:<10} ${pnl:<14.2f} {reward:<15.2f} {loss:<15.6f} {steps:<10}\n")
             
             f.write("\n" + "=" * 100 + "\n")
             f.write("SUMMARY STATISTICS\n")
@@ -1323,12 +1641,22 @@ def train_agent(env: SPXTradingEnv, agent, num_episodes: int = 1000,
                 f.write("First 10 Episodes:\n")
                 f.write(f"  Avg P&L: ${np.mean(episode_pnls[:10]):.2f} ± ${np.std(episode_pnls[:10]):.2f}\n")
                 f.write(f"  Avg Reward: {np.mean(episode_rewards[:10]):.2f} ± {np.std(episode_rewards[:10]):.2f}\n")
-                f.write(f"  Avg Loss: {np.mean(episode_losses[:10]):.6f}\n\n")
+                f.write(f"  Avg Loss: {np.mean(episode_losses[:10]):.6f}\n")
+                if len(episode_policy_losses) > 0:
+                    f.write(f"  Avg Policy Loss: {np.mean(episode_policy_losses[:10]):.6f}\n")
+                    f.write(f"  Avg Value Loss: {np.mean(episode_value_losses[:10]):.6f}\n")
+                    f.write(f"  Avg Entropy: {np.mean(episode_entropies[:10]):.6f}\n")
+                f.write("\n")
                 
                 f.write("Last 10 Episodes:\n")
                 f.write(f"  Avg P&L: ${np.mean(episode_pnls[-10:]):.2f} ± ${np.std(episode_pnls[-10:]):.2f}\n")
                 f.write(f"  Avg Reward: {np.mean(episode_rewards[-10:]):.2f} ± {np.std(episode_rewards[-10:]):.2f}\n")
-                f.write(f"  Avg Loss: {np.mean(episode_losses[-10:]):.6f}\n\n")
+                f.write(f"  Avg Loss: {np.mean(episode_losses[-10:]):.6f}\n")
+                if len(episode_policy_losses) > 0:
+                    f.write(f"  Avg Policy Loss: {np.mean(episode_policy_losses[-10:]):.6f}\n")
+                    f.write(f"  Avg Value Loss: {np.mean(episode_value_losses[-10:]):.6f}\n")
+                    f.write(f"  Avg Entropy: {np.mean(episode_entropies[-10:]):.6f}\n")
+                f.write("\n")
                 
                 pnl_improvement = np.mean(episode_pnls[-10:]) - np.mean(episode_pnls[:10])
                 reward_improvement = np.mean(episode_rewards[-10:]) - np.mean(episode_rewards[:10])
@@ -1369,6 +1697,9 @@ def evaluate_agent(env: SPXTradingEnv, agent, num_episodes: int = 10,
     print(f"📊 EVALUATING AGENT FOR {num_episodes} EPISODES")
     print(f"{'=' * 100}")
     
+    # Set progress to 1.0 for evaluation so no overtrading penalty is applied
+    env.set_training_progress(1.0)
+    
     episode_rewards = []
     episode_pnls = []
     episode_steps = []
@@ -1387,14 +1718,20 @@ def evaluate_agent(env: SPXTradingEnv, agent, num_episodes: int = 10,
         while True:
             # Choose action (handle both DQN and PPO)
             if _is_ppo_agent(agent):
-                action = agent.act(state, training=False)
-                risk_multiplier = None
-            elif _is_dqn_agent(agent):
                 act_result = agent.act(state, training=False)
                 if isinstance(act_result, tuple):
                     action, risk_multiplier = act_result
                 else:
                     action = act_result
+                    risk_multiplier = None
+                action = int(action)  # Ensure action is int
+            elif _is_dqn_agent(agent):
+                act_result = agent.act(state, training=False)
+                if isinstance(act_result, tuple):
+                    action, risk_multiplier = act_result
+                    action = int(action)  # Ensure action is int
+                else:
+                    action = int(act_result)  # Ensure action is int
                     risk_multiplier = None
             else:
                 raise ValueError(f"Unknown agent type: {type(agent)}")
@@ -1577,14 +1914,14 @@ def quick_validation_test(env: SPXTradingEnv, agent, num_test_episodes: int = 3)
             print(f"  ✓ Q-network forward pass works")
             print(f"    Q-values shape: {q_values.shape}, range: [{q_values.min():.2f}, {q_values.max():.2f}]")
         elif _is_ppo_agent(agent):
-            action_logits, value = agent.actor_critic(state_tensor)
+            action_logits, value, risk_mult = agent.actor_critic(state_tensor)
             assert action_logits.shape == (1, agent.action_size), \
                 f"Action logits shape incorrect: {action_logits.shape}, expected (1, {agent.action_size})"
             assert value.shape == (1, 1), f"Value shape incorrect: {value.shape}, expected (1, 1)"
             assert not torch.isnan(action_logits).any(), "Action logits contain NaN!"
             assert not torch.isnan(value).any(), "Value contains NaN!"
             print(f"  ✓ Actor-critic forward pass works")
-            print(f"    Action logits shape: {action_logits.shape}, Value: {value.item():.2f}")
+            print(f"    Action logits shape: {action_logits.shape}, Value: {value.item():.2f}, Risk: {risk_mult.item():.2f}")
         else:
             raise ValueError(f"Unknown agent type: {type(agent)}")
     except Exception as e:
@@ -1596,8 +1933,12 @@ def quick_validation_test(env: SPXTradingEnv, agent, num_test_episodes: int = 3)
     try:
         state = env.reset()
         if _is_ppo_agent(agent):
-            action = agent.act(state, training=True)
-            risk_multiplier = None
+            act_result = agent.act(state, training=True)
+            if isinstance(act_result, tuple):
+                action, risk_multiplier = act_result
+            else:
+                action = act_result
+                risk_multiplier = None
         elif _is_dqn_agent(agent):
             act_result = agent.act(state, training=True)
             if isinstance(act_result, tuple):
@@ -1754,7 +2095,8 @@ def quick_validation_test(env: SPXTradingEnv, agent, num_test_episodes: int = 3)
 
 def optimize_stop_loss(data_path: str, model_path: str, device: str = 'cpu',
                         stop_loss_candidates: Optional[list] = None, num_eval_episodes: int = 20,
-                        agent_checkpoint: Optional[str] = None) -> dict:
+                        agent_checkpoint: Optional[str] = None,
+                        max_position: int = 2) -> dict:
     """
     Optimize stop_loss_per_contract by testing different values and selecting the one
     with highest average P&L.
@@ -1766,6 +2108,7 @@ def optimize_stop_loss(data_path: str, model_path: str, device: str = 'cpu',
         stop_loss_candidates: List of stop_loss values to test (default: [200, 300, 400, 500, 600, 700, 800])
         num_eval_episodes: Number of episodes to evaluate each stop_loss value
         agent_checkpoint: Path to trained agent checkpoint (if None, uses random agent)
+        max_position: Maximum number of contracts to hold (default: 2)
     
     Returns:
         Dictionary with results: {'best_stop_loss': value, 'best_avg_pnl': value, 'all_results': [...]}
@@ -1778,6 +2121,7 @@ def optimize_stop_loss(data_path: str, model_path: str, device: str = 'cpu',
     print("=" * 100)
     print(f"Testing {len(stop_loss_candidates)} stop-loss values: {stop_loss_candidates}")
     print(f"Evaluating each with {num_eval_episodes} episodes")
+    print(f"Using max_position = {max_position}")
     print("=" * 100)
     
     results = []
@@ -1793,7 +2137,8 @@ def optimize_stop_loss(data_path: str, model_path: str, device: str = 'cpu',
             max_steps_per_episode=5000,
             max_loss_per_episode=-50000.0,
             stop_loss_per_contract=stop_loss,
-            variance_adaptive_risk=False  # Disable for optimization to test fixed values
+            variance_adaptive_risk=False,  # Disable for optimization to test fixed values
+            max_position=max_position
         )
         
         # Create or load agent
@@ -1893,8 +2238,13 @@ def optimize_stop_loss(data_path: str, model_path: str, device: str = 'cpu',
             while True:
                 # Choose action (handle both DQN and PPO)
                 if _is_ppo_agent(agent):
-                    action = agent.act(state, training=False)
-                    risk_multiplier = None
+                    act_result = agent.act(state, training=False)
+                    if isinstance(act_result, tuple):
+                        action, risk_multiplier = act_result
+                    else:
+                        action = act_result
+                        risk_multiplier = None
+                    action = int(action)
                 elif _is_dqn_agent(agent):
                     act_result = agent.act(state, training=False)
                     if isinstance(act_result, tuple):
@@ -1999,7 +2349,8 @@ def optimize_stop_loss(data_path: str, model_path: str, device: str = 'cpu',
 def analyze_episode_strategy(data_path: str, model_path: str, device: str = 'cpu',
                              agent_checkpoint: Optional[str] = None, 
                              num_episodes: int = 1,
-                             episode_indices: Optional[list] = None):
+                             episode_indices: Optional[list] = None,
+                             max_position: int = 2):
     """
     Analyze specific episodes in detail to understand the agent's strategy.
     
@@ -2010,6 +2361,7 @@ def analyze_episode_strategy(data_path: str, model_path: str, device: str = 'cpu
         agent_checkpoint: Path to agent checkpoint (default: latest final checkpoint)
         num_episodes: Number of episodes to analyze (default: 1)
         episode_indices: Specific episode indices to analyze (if None, analyzes first num_episodes)
+        max_position: Maximum number of contracts to hold (default: 2)
     """
     print("\n" + "=" * 100)
     print("📊 DETAILED EPISODE STRATEGY ANALYSIS")
@@ -2022,7 +2374,8 @@ def analyze_episode_strategy(data_path: str, model_path: str, device: str = 'cpu
         device=device,
         max_steps_per_episode=5000,
         max_loss_per_episode=-50000.0,
-        stop_loss_per_contract=500.0
+        stop_loss_per_contract=500.0,
+        max_position=max_position
     )
     
     # Load agent
@@ -2073,7 +2426,21 @@ def analyze_episode_strategy(data_path: str, model_path: str, device: str = 'cpu
         return
     
     # Analyze episodes
-    action_names = {0: "Sell 2", 1: "Sell 1", 2: "Hold", 3: "Buy 1", 4: "Buy 2"}
+    # Dynamic action names based on environment's max_position
+    if hasattr(env, 'max_position'):
+        max_pos = env.max_position
+        action_names = {}
+        for a in range(env.action_space_size):
+            change = a - max_pos
+            if change == 0:
+                action_names[a] = "Hold"
+            elif change > 0:
+                action_names[a] = f"Buy {change}"
+            else:
+                action_names[a] = f"Sell {abs(change)}"
+    else:
+        # Fallback for old 5-action space
+        action_names = {0: "Sell 2", 1: "Sell 1", 2: "Hold", 3: "Buy 1", 4: "Buy 2"}
     
     for ep_idx in range(num_episodes):
         print(f"\n{'=' * 100}")
@@ -2109,15 +2476,20 @@ def analyze_episode_strategy(data_path: str, model_path: str, device: str = 'cpu
                 if _is_dqn_agent(agent):
                     q_vals = agent.q_network(state_tensor).cpu().numpy()[0]
                 elif _is_ppo_agent(agent):
-                    action_logits, _ = agent.actor_critic(state_tensor)  # type: ignore[attr-defined]
+                    action_logits, _, _ = agent.actor_critic(state_tensor)  # type: ignore[attr-defined]
                     q_vals = torch.softmax(action_logits, dim=1).cpu().numpy()[0]  # Use probabilities as proxy
                 else:
                     q_vals = np.zeros(agent.action_size)
             
             # Choose action (handle both DQN and PPO)
             if _is_ppo_agent(agent):
-                action = agent.act(state, training=False)
-                risk_multiplier = None
+                act_result = agent.act(state, training=False)
+                if isinstance(act_result, tuple):
+                    action, risk_multiplier = act_result
+                else:
+                    action = act_result
+                    risk_multiplier = None
+                action = int(action)
             elif _is_dqn_agent(agent):
                 act_result = agent.act(state, training=False)
                 if isinstance(act_result, tuple):

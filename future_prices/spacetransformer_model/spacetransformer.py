@@ -22,6 +22,7 @@ from typing import Optional
 from .data_loader import load_data
 from .model import SpaceTimeFormer
 from .train import TimeSeriesDataset, train_model
+from .utils import get_device
 
 
 def main(
@@ -168,17 +169,24 @@ def main(
     
     # Create data loaders with optimizations for GPU
     print("\n[3/5] Creating data loaders...")
+    
+    # Auto-detect device type for optimizations
+    device = get_device()
+    is_gpu = device.type in ['cuda', 'mps']
+    
     # Optimize DataLoader for GPU based on use_gpu_optimizations flag
     if use_gpu_optimizations:
-        # Aggressive optimizations: more workers, prefetching
-        num_workers = min(8, os.cpu_count() or 1)  # Increased to 8 workers for better throughput
-        prefetch_factor = 2 if batch_size >= 32 else 1
+        # Aggressive optimizations for high-end hardware (e.g., 40-core GPU)
+        # More workers and higher prefetch factor to prevent CPU bottleneck
+        num_workers = min(12, os.cpu_count() or 1)
+        prefetch_factor = 4 if batch_size >= 64 else 2
     else:
         # Conservative defaults
-        num_workers = min(4, os.cpu_count() or 1)  # Standard 4 workers
-        prefetch_factor = 1  # No prefetching
+        num_workers = min(4, os.cpu_count() or 1)
+        prefetch_factor = 2
     
-    pin_memory = torch.cuda.is_available()
+    # pin_memory is beneficial for both CUDA and MPS
+    pin_memory = is_gpu
     
     train_loader = DataLoader(
         train_dataset, 
@@ -249,13 +257,39 @@ def main(
     )
     
     # Resume from checkpoint if provided
+    start_epoch = 0
+    checkpoint_history = None
+    resume_optimizer_state = None
+    resume_scaler_state = None
+    
+    # Check for latest checkpoint first
+    if resume_path:
+        latest_path = resume_path.replace('.pth', '_latest.pth')
+        if os.path.exists(latest_path):
+            print(f"  -> Found latest intermediate checkpoint: {latest_path}")
+            resume_path = latest_path
+
     if resume_path and os.path.exists(resume_path):
         print(f"\n[4.5/5] Resuming from checkpoint: {resume_path}")
         try:
             # Load on CPU first to avoid OOM, then model.to(device) handles moving
             checkpoint = torch.load(resume_path, map_location='cpu')
             model.load_state_dict(checkpoint['model_state_dict'])
-            print("  -> Weights loaded successfully")
+            
+            # Extract epoch and history
+            start_epoch = checkpoint.get('epoch', 0)
+            checkpoint_history = checkpoint.get('history', None)
+            resume_optimizer_state = checkpoint.get('optimizer_state_dict', None)
+            resume_scaler_state = checkpoint.get('scaler', None)
+            batch_idx = checkpoint.get('batch_idx', None)
+            
+            # If we resumed from a mid-epoch batch, we should start at the next epoch
+            # or skip batches. For simplicity, we start at the next epoch if it was mid-epoch.
+            if batch_idx is not None:
+                print(f"  -> Resumed from mid-epoch batch {batch_idx}. Will start from next epoch.")
+                start_epoch += 1
+            
+            print(f"  -> Weights loaded successfully (Next Epoch: {start_epoch})")
         except Exception as e:
             print(f"  -> WARNING: Could not load checkpoint: {e}")
             print("  -> Check if architecture (d_model, n_heads, etc.) matches.")
@@ -301,14 +335,18 @@ def main(
         val_loader=val_loader,
         n_epochs=n_epochs,
         learning_rate=learning_rate,
-        device=torch.device('cuda' if torch.cuda.is_available() else 'cpu'),
+        device=get_device(),
         patience=15,
         save_path=save_model_path,
         target_indices=target_indices,
         scaler=scaler,  # Pass scaler to save in checkpoint
         use_amp=use_amp,
         gradient_accumulation_steps=gradient_accumulation_steps,
-        compile_model=compile_model
+        compile_model=compile_model,
+        start_epoch=start_epoch,
+        resume_history=checkpoint_history,
+        resume_optimizer_state=resume_optimizer_state,
+        resume_scaler_state=resume_scaler_state
     )
     
     print("\n" + "=" * 80)

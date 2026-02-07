@@ -1515,8 +1515,13 @@ def main():
     TRANSFORMER_LAYERS = 10  # Number of transformer encoder layers
     DIM_FEEDFORWARD = 1024  # Feedforward network dimension
     
-    # Check if CUDA is available
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    # Check for best available device
+    if torch.cuda.is_available():
+        device = torch.device('cuda')
+    elif torch.backends.mps.is_available():
+        device = torch.device('mps')
+    else:
+        device = torch.device('cpu')
     print(f"Using device: {device}")
     
     # Detailed GPU diagnostics
@@ -1535,8 +1540,20 @@ def main():
         
         torch.cuda.empty_cache()
         print(f"CUDA cache cleared. GPU: {torch.cuda.get_device_name(0)}")
+    elif torch.backends.mps.is_available():
+        print(f"\n{'='*60}")
+        print("METAL (MPS) DIAGNOSTICS")
+        print(f"{'='*60}")
+        print(f"MPS Available: {torch.backends.mps.is_available()}")
+        print(f"MPS Built: {torch.backends.mps.is_built()}")
+        print(f"PyTorch Version: {torch.__version__}")
+        print(f"{'='*60}\n")
+        
+        if hasattr(torch, 'mps') and hasattr(torch.mps, 'empty_cache'):
+            torch.mps.empty_cache()
+            print("MPS cache cleared.")
     else:
-        print("\n⚠️ WARNING: CUDA is not available! Training will use CPU (much slower).")
+        print("\n⚠️ WARNING: Neither CUDA nor MPS is available! Training will use CPU (much slower).")
         print("Check:")
         print("  1. NVIDIA drivers are installed")
         print("  2. CUDA toolkit is installed")

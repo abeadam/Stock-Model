@@ -9,8 +9,6 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import train_test_split
 from typing import Tuple, List, Optional
 
-from .utils import extract_cyclical_time_features
-
 
 def load_data(data_path: str,
               test_size: float = 0.2, random_state: int = 42,
@@ -53,9 +51,6 @@ def load_data(data_path: str,
     else:
         df = pd.read_csv(data_path)
     
-    # Extract cyclical time features from datetime columns
-    df = extract_cyclical_time_features(df)
-
     # Select feature columns
     # Forward-looking columns contain future information
     forward_looking_cols = ['PctChange_ToMaxHigh_5', 'PctChange_ToMinLow_5']

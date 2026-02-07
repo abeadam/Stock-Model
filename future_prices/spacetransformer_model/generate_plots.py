@@ -7,6 +7,7 @@ import os
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
+import argparse
 from torch.utils.data import DataLoader
 from pathlib import Path
 from typing import Optional, Any
@@ -17,6 +18,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from spacetransformer_model.data_loader import load_data
 from spacetransformer_model.model import SpaceTimeFormer
 from spacetransformer_model.train import TimeSeriesDataset
+from spacetransformer_model.utils import get_device
 
 
 def load_model(checkpoint_path: str, device: torch.device) -> tuple:
@@ -369,9 +371,67 @@ def plot_predictions(
 
 def main():
     """Main function to generate plots."""
-    # Configuration
-    checkpoint_path = '/home/wiseguy/dev/future_prices/spacetransformer_model/checkpoints/spacetimeformer_best.pth'
-    data_path = '/home/wiseguy/dev/future_prices/es_with_indicators.csv'
+    parser = argparse.ArgumentParser(description='Generate prediction plots from trained SpaceTimeFormer model')
+    parser.add_argument(
+        '--checkpoint',
+        type=str,
+        default=None,
+        help='Path to checkpoint file (default: auto-detect latest or best)'
+    )
+    parser.add_argument(
+        '--data',
+        type=str,
+        default=None,
+        help='Path to data CSV file (default: ../es_with_indicators.csv)'
+    )
+    parser.add_argument(
+        '--use-latest',
+        action='store_true',
+        help='Prefer _latest.pth checkpoint if available (default: prefer best)'
+    )
+    
+    args = parser.parse_args()
+    
+    # Get script directory for relative paths
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    checkpoints_dir = os.path.join(script_dir, 'checkpoints')
+    parent_dir = os.path.dirname(script_dir)
+    
+    # Auto-detect checkpoint if not provided
+    if args.checkpoint is None:
+        checkpoint_best = os.path.join(checkpoints_dir, 'spacetimeformer_best.pth')
+        checkpoint_latest = os.path.join(checkpoints_dir, 'spacetimeformer_best_latest.pth')
+        
+        # Prefer best checkpoint by default, only use latest if explicitly requested or best doesn't exist
+        if args.use_latest and os.path.exists(checkpoint_latest):
+            checkpoint_path = checkpoint_latest
+            print(f"Using latest checkpoint: {checkpoint_path}")
+        elif os.path.exists(checkpoint_best):
+            checkpoint_path = checkpoint_best
+            print(f"Using best checkpoint: {checkpoint_path}")
+        elif os.path.exists(checkpoint_latest):
+            checkpoint_path = checkpoint_latest
+            print(f"Using latest checkpoint (best not found): {checkpoint_path}")
+        else:
+            raise FileNotFoundError(
+                f"No checkpoint found. Looked for:\n"
+                f"  - {checkpoint_best}\n"
+                f"  - {checkpoint_latest}"
+            )
+    else:
+        checkpoint_path = args.checkpoint
+        if not os.path.exists(checkpoint_path):
+            raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+    
+    # Auto-detect data path if not provided
+    if args.data is None:
+        data_path = os.path.join(parent_dir, 'es_with_indicators.csv')
+        if not os.path.exists(data_path):
+            raise FileNotFoundError(f"Data file not found: {data_path}")
+    else:
+        data_path = args.data
+        if not os.path.exists(data_path):
+            raise FileNotFoundError(f"Data file not found: {data_path}")
     
     # Model hyperparameters (should match training)
     context_length = 96
@@ -384,7 +444,7 @@ def main():
     target_columns = ['High', 'Low', 'Close']
     
     # Device
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    device = get_device()
     print(f"Using device: {device}")
     
     # Load model first (architecture parameters are in checkpoint)

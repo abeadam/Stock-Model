@@ -35,6 +35,7 @@ logging.getLogger('torch.jit').setLevel(logging.ERROR)
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from spacetransformer_model.model import SpaceTimeFormer
+from spacetransformer_model.utils import get_device
 
 
 class RealtimePredictor:
@@ -66,8 +67,9 @@ class RealtimePredictor:
         """
         # Auto-detect device if not specified
         if device is None:
-            device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        self.device = torch.device(device)
+            self.device = get_device()
+        else:
+            self.device = torch.device(device)
         self.use_parallel = use_parallel
         self.use_quantization = use_quantization
         self.use_fp16 = use_fp16

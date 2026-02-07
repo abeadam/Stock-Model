@@ -23,11 +23,17 @@ from torch.distributions import Categorical
 from typing import Tuple, Optional, Dict, List
 from collections import deque
 import random
+import pickle
 from sklearn.preprocessing import StandardScaler
 
 # Import the model class from the futures model file
 import sys
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# Add parent and MVE_SSNs_model directories to path for imports
+script_dir = os.path.dirname(os.path.abspath(__file__))
+parent_dir = os.path.dirname(script_dir)
+sys.path.insert(0, script_dir)
+sys.path.insert(0, parent_dir)
+sys.path.insert(0, os.path.join(parent_dir, 'MVE_SSNs_model'))
 from futures_model_MVE_SNNs import MVEModel
 
 # Import PPO agent (optional - only needed if using --ppo flag)
@@ -37,35 +43,40 @@ except ImportError:
     PPOAgent = None  # PPO not available
 
 
-# SPXTradingEnv is now in futures_reinforcement_utils
-# Import it after DQNAgent is defined (see below)
+class SPXTradingEnv:
     """
     Reinforcement Learning Environment for SPX Trading
     
     State: Previous step's all non-forward-looking features + current position + 
-           model predictions (mean_high, std_high, mean_low, std_low)
+           model predictions (mean_high, std_high, mean_low, std_low) [optional] + 
+           stop-loss threshold
     Actions: Buy 0, 1, or 2 units OR Sell 0, 1, or 2 units (net change in position)
     Reward: Profit/loss from trading minus transaction costs ($2.5 per contract)
     """
     
-    def __init__(self, data_path: str, model_path: str, device: str = 'cpu',
+    def __init__(self, data_path: str, model_path: Optional[str] = None, device: str = 'cpu',
                  max_steps_per_episode: int = 5000, max_loss_per_episode: float = -50000.0,
                  stop_loss_per_contract: float = 500.0, 
                  variance_adaptive_risk: bool = True,
-                 variance_risk_sensitivity: float = 0.5):
+                 variance_risk_sensitivity: float = 0.5,
+                 max_position: int = 2,
+                 scaler_path: Optional[str] = None):
         """
         Initialize the trading environment
         
         Args:
             data_path: Path to es_with_indicators.csv
-            model_path: Path to futures_model.pt
+            model_path: Path to futures_model.pt (optional)
             device: Device to run model on ('cpu' or 'cuda')
             max_steps_per_episode: Maximum steps per episode (default: 5000, was unlimited)
             max_loss_per_episode: Maximum loss before early termination (default: -$50k)
             stop_loss_per_contract: Base stop loss threshold per contract (default: $500)
             variance_adaptive_risk: If True, adjust stop-loss based on predicted variance (default: True)
+                                   Note: requires model_path to be provided.
             variance_risk_sensitivity: How much variance affects risk (0.0-1.0, default: 0.5)
                                     Higher = more aggressive adjustment based on variance
+            max_position: Maximum number of contracts to hold (long or short, default: 2)
+            scaler_path: Optional path to save/load feature scaler (ensures consistency)
         """
         self.device = device
         self.data_path = data_path
@@ -73,8 +84,19 @@ except ImportError:
         self.max_steps_per_episode = max_steps_per_episode
         self.max_loss_per_episode = max_loss_per_episode
         self.base_stop_loss_per_contract = stop_loss_per_contract
-        self.variance_adaptive_risk = variance_adaptive_risk
+        self.variance_adaptive_risk = variance_adaptive_risk and model_path is not None
         self.variance_risk_sensitivity = variance_risk_sensitivity
+        self.max_position = max_position
+        self.min_position = -max_position
+        
+        # Determine scaler path if not provided
+        if scaler_path is None:
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            results_dir = os.path.join(script_dir, 'reinforcement_results')
+            os.makedirs(results_dir, exist_ok=True)
+            self.scaler_path = os.path.join(results_dir, 'feature_scaler.pkl')
+        else:
+            self.scaler_path = scaler_path
         
         # Track current variance predictions for adaptive risk
         self.current_pred_std_high = 0.0
@@ -95,44 +117,49 @@ except ImportError:
         self.df = self.df.dropna(subset=required_cols).reset_index(drop=True)
         print(f"Loaded {len(self.df)} rows (removed {initial_len - len(self.df)} rows with NaN)")
         
-        # Load the pre-trained model
-        print(f"Loading model from {model_path}...")
-        checkpoint = torch.load(model_path, map_location=device, weights_only=False)
-        
-        # Reconstruct model
-        self.input_dim = checkpoint['input_dim']
-        self.hidden_dims = checkpoint['hidden_dims']
-        self.scaler = checkpoint['scaler']
-        self.feature_names = checkpoint['feature_names']
-        
-        # Determine if model predicts both high and low
-        # Check if model has quantile heads (predict_both=True)
-        state_dict_keys = list(checkpoint['model_state_dict'].keys())
-        self.predict_both = any('quantile_10_head' in key for key in state_dict_keys)
-        
-        # Create model instance
-        self.model = MVEModel(
-            input_dim=self.input_dim,
-            hidden_dims=self.hidden_dims,
-            dropout_rate=0.0,
-            predict_both=self.predict_both
-        )
-        self.model.load_state_dict(checkpoint['model_state_dict'])
-        self.model.to(device)
-        self.model.eval()
-        
-        # Compile model for faster inference (PyTorch 2.0+)
-        try:
-            self.model = torch.compile(self.model, mode='reduce-overhead')
-            print(f"Model compiled for faster inference")
-        except Exception as e:
-            print(f"Model compilation not available (PyTorch < 2.0 or error: {e}), using standard model")
-        
-        print(f"Model loaded. predict_both={self.predict_both}, input_dim={self.input_dim}")
+        # Load the pre-trained model (if provided)
+        if model_path is not None:
+            print(f"Loading model from {model_path}...")
+            checkpoint = torch.load(model_path, map_location=device, weights_only=False)
+            
+            # Reconstruct model
+            self.input_dim = checkpoint['input_dim']
+            self.hidden_dims = checkpoint['hidden_dims']
+            self.scaler = checkpoint['scaler']
+            self.feature_names = checkpoint['feature_names']
+            
+            # Determine if model predicts both high and low
+            # Check if model has quantile heads (predict_both=True)
+            state_dict_keys = list(checkpoint['model_state_dict'].keys())
+            self.predict_both = any('quantile_10_head' in key for key in state_dict_keys)
+            
+            # Create model instance
+            self.model = MVEModel(
+                input_dim=self.input_dim,
+                hidden_dims=self.hidden_dims,
+                dropout_rate=0.0,
+                predict_both=self.predict_both
+            )
+            self.model.load_state_dict(checkpoint['model_state_dict'])
+            self.model.to(device)
+            self.model.eval()
+            
+            # Compile model for faster inference (PyTorch 2.0+)
+            try:
+                self.model = torch.compile(self.model, mode='reduce-overhead')
+                print(f"Model compiled for faster inference")
+            except Exception as e:
+                print(f"Model compilation not available (PyTorch < 2.0 or error: {e}), using standard model")
+            
+            print(f"Model loaded. predict_both={self.predict_both}, input_dim={self.input_dim}")
+        else:
+            print("No prediction model provided. RL will learn directly from raw data.")
+            self.model = None
+            self.scaler = None
+            self.feature_names = []
+            self.predict_both = False
         
         # Trading parameters
-        self.max_position = 2  # Maximum position (long or short)
-        self.min_position = -2  # Minimum position (short)
         self.initial_position = 0
         self.transaction_cost_per_contract = 2.5  # $2.5 per futures contract
         self.trade_penalty_per_contract = 0.0  # Removed - was discouraging all trading
@@ -159,20 +186,45 @@ except ImportError:
         print(f"Using {len(self.feature_cols)} non-forward-looking features for state")
         print(f"Excluded columns: {exclude_cols}")
         
-        # Create scaler for all features
+        # Create or load scaler for all features
         # Remove rows with NaN in feature columns for fitting scaler
         feature_data = self.df[self.feature_cols].copy()
         # Fill NaN with 0 for features (some indicators may have NaN at start)
         feature_data = feature_data.fillna(0)
+        
         self.feature_scaler = StandardScaler()
-        self.feature_scaler.fit(feature_data.values)
         
-        print(f"Feature scaler fitted on {len(feature_data)} samples")
+        if os.path.exists(self.scaler_path):
+            print(f"Loading feature scaler from {self.scaler_path}...")
+            try:
+                with open(self.scaler_path, 'rb') as f:
+                    self.feature_scaler = pickle.load(f)
+                print(f"✓ Feature scaler loaded successfully")
+            except Exception as e:
+                print(f"⚠️ Error loading scaler from {self.scaler_path}: {e}")
+                print(f"Fitting new scaler instead...")
+                self.feature_scaler.fit(feature_data.values)
+                # Save the newly fitted scaler
+                try:
+                    with open(self.scaler_path, 'wb') as f:
+                        pickle.dump(self.feature_scaler, f)
+                except:
+                    pass
+        else:
+            print(f"No scaler found at {self.scaler_path}. Fitting new scaler...")
+            self.feature_scaler.fit(feature_data.values)
+            # Save the newly fitted scaler
+            try:
+                with open(self.scaler_path, 'wb') as f:
+                    pickle.dump(self.feature_scaler, f)
+                print(f"✓ Saved new feature scaler to {self.scaler_path}")
+            except Exception as e:
+                print(f"⚠️ Could not save scaler to {self.scaler_path}: {e}")
         
-        # Action space: net change in position from -2 to +2
-        # Actions: -2, -1, 0, 1, 2 (sell 2, sell 1, hold, buy 1, buy 2)
-        self.action_space_size = 5
-        self.action_map = {-2: -2, -1: -1, 0: 0, 1: 1, 2: 2}
+        # Action space: net change in position from -max_position to +max_position
+        # Actions: 0 to 2*max_position (maps to -max_position to +max_position)
+        self.action_space_size = 2 * self.max_position + 1
+        # No mapping dictionary needed anymore, we'll calculate it in step()
         
         # Episode tracking
         self.step_count = 0
@@ -195,6 +247,7 @@ except ImportError:
         self.position = self.initial_position
         self.cash = 0.0  # Track cash (negative means we owe money)
         self.total_pnl = 0.0
+        self.prev_unrealized_pnl = 0.0
         self.avg_entry_price = 0.0  # Average entry price for current position
         self.position_value = 0.0  # Value of current position
         self.peak_pnl = 0.0  # Track peak P&L for drawdown calculation
@@ -214,7 +267,8 @@ except ImportError:
         - Previous step's all non-forward-looking features (normalized)
         - Current position (normalized)
         - Model predictions: mean_high, std_high, mean_low, std_low
-          (if model predicts both, otherwise high and low use same values)
+          (if model is present)
+        - Current stop-loss threshold (normalized)
         """
         if self.current_step == 0:
             # Use current step if no previous step available
@@ -238,67 +292,72 @@ except ImportError:
         feature_array = np.array(feature_values).reshape(1, -1)
         features_normalized = self.feature_scaler.transform(feature_array)[0]
         
-        # Get model prediction using previous step's data
-        # Extract features that the model expects (from feature_names)
-        model_features = []
-        for feat_name in self.feature_names:
-            if feat_name in self.df.columns:
-                val = prev_row[feat_name]
-                if pd.isna(val):
-                    model_features.append(0.0)
+        # Get model prediction using previous step's data (if model is available)
+        model_outputs = []
+        if self.model is not None:
+            # Extract features that the model expects (from feature_names)
+            model_features = []
+            for feat_name in self.feature_names:
+                if feat_name in self.df.columns:
+                    val = prev_row[feat_name]
+                    if pd.isna(val):
+                        model_features.append(0.0)
+                    else:
+                        model_features.append(float(val))
                 else:
-                    model_features.append(float(val))
-            else:
-                model_features.append(0.0)
-        
-        model_features = np.array(model_features).reshape(1, -1)
-        model_features_scaled = self.scaler.transform(model_features)
-        
-        # Get prediction from model
-        with torch.no_grad():
-            # Keep tensor on device for faster computation
-            features_tensor = torch.FloatTensor(model_features_scaled).to(self.device)
-            model_output = self.model(features_tensor)
+                    model_features.append(0.0)
             
-            if self.predict_both:
-                (mean_high, mean_low), (log_var_high, log_var_low) = model_output
-                # Compute std on GPU (faster), then transfer once
-                pred_std_high = (log_var_high * 0.5).exp().cpu().numpy()[0, 0]  # exp(0.5*log_var) = sqrt(exp(log_var))
-                pred_std_low = (log_var_low * 0.5).exp().cpu().numpy()[0, 0]
-                # Transfer means
-                pred_mean_high = mean_high.cpu().numpy()[0, 0]
-                pred_mean_low = mean_low.cpu().numpy()[0, 0]
-            else:
-                mean_pred, log_var_pred = model_output
-                # Compute std on GPU (faster)
-                pred_std_high = (log_var_pred * 0.5).exp().cpu().numpy()[0, 0]
-                pred_mean_high = mean_pred.cpu().numpy()[0, 0]
-                # If model doesn't predict both, use same values for low
-                pred_mean_low = pred_mean_high
-                pred_std_low = pred_std_high
+            model_features = np.array(model_features).reshape(1, -1)
+            model_features_scaled = self.scaler.transform(model_features)
+            
+            # Get prediction from model
+            with torch.no_grad():
+                # Keep tensor on device for faster computation
+                features_tensor = torch.FloatTensor(model_features_scaled).to(self.device)
+                model_output = self.model(features_tensor)
+                
+                if self.predict_both:
+                    (mean_high, mean_low), (log_var_high, log_var_low) = model_output
+                    # Compute std on GPU (faster), then transfer once
+                    pred_std_high = (log_var_high * 0.5).exp().cpu().numpy()[0, 0]  # exp(0.5*log_var) = sqrt(exp(log_var))
+                    pred_std_low = (log_var_low * 0.5).exp().cpu().numpy()[0, 0]
+                    # Transfer means
+                    pred_mean_high = mean_high.cpu().numpy()[0, 0]
+                    pred_mean_low = mean_low.cpu().numpy()[0, 0]
+                else:
+                    mean_pred, log_var_pred = model_output
+                    # Compute std on GPU (faster)
+                    pred_std_high = (log_var_pred * 0.5).exp().cpu().numpy()[0, 0]
+                    pred_mean_high = mean_pred.cpu().numpy()[0, 0]
+                    # If model doesn't predict both, use same values for low
+                    pred_mean_low = pred_mean_high
+                    pred_std_low = pred_std_high
+            
+            # Store current variance predictions for adaptive risk control
+            self.current_pred_std_high = pred_std_high
+            self.current_pred_std_low = pred_std_low
+            model_outputs = [pred_mean_high, pred_std_high, pred_mean_low, pred_std_low]
+        else:
+            # If no model, we don't have predictions or variance
+            self.current_pred_std_high = 0.0
+            self.current_pred_std_low = 0.0
+            model_outputs = []
         
-        # Store current variance predictions for adaptive risk control
-        self.current_pred_std_high = pred_std_high
-        self.current_pred_std_low = pred_std_low
-        
-        # Calculate adaptive stop-loss based on predicted variance
-        if self.variance_adaptive_risk:
+        # Calculate adaptive stop-loss based on predicted variance (only if model is present)
+        if self.variance_adaptive_risk and self.model is not None:
             # Higher variance (uncertainty) = tighter stop-loss (more conservative)
             # Lower variance (confidence) = looser stop-loss (more aggressive)
             # Use the maximum of high/low variance to be conservative
-            max_pred_std = max(abs(pred_std_high), abs(pred_std_low))
+            max_pred_std = max(abs(self.current_pred_std_high), abs(self.current_pred_std_low))
             
             # Normalize variance to a scale factor (0.5 to 2.0)
             # Typical std values are in range 0.001-0.1 (percentage changes)
-            # Map to risk adjustment: low std (0.001) → 1.5x (looser), high std (0.1) → 0.5x (tighter)
-            # Using exponential mapping for smooth adjustment
             if max_pred_std < 0.001:
                 variance_factor = 1.5  # Very confident: allow larger losses
             elif max_pred_std > 0.1:
                 variance_factor = 0.5  # Very uncertain: tighten stop-loss
             else:
                 # Linear interpolation between 0.001 and 0.1
-                # At 0.001: factor = 1.5, at 0.1: factor = 0.5
                 normalized_std = (max_pred_std - 0.001) / (0.1 - 0.001)
                 variance_factor = 1.5 - (1.5 - 0.5) * normalized_std
             
@@ -317,18 +376,22 @@ except ImportError:
         # Update stop_loss_normalized (using current adaptive stop-loss)
         self.stop_loss_normalized = (self.current_stop_loss_per_contract - 100.0) / 900.0  # Normalize to [0, 1] for 100-1000 range
         
-        # Combine state: [all_features, position, pred_mean_high, pred_std_high, pred_mean_low, pred_std_low, stop_loss]
-        # This gives the agent information about both expected high and low price movements
+        # Combine state: [all_features, position, [predictions], stop_loss]
+        # This gives the agent information about both expected high and low price movements (if available)
         # AND the current stop-loss threshold (so it can learn to adapt to different risk levels)
-        state = np.concatenate([
+        state_components = [
             features_normalized,  # All non-forward-looking features
             [position_normalized],  # 1 value
-            [pred_mean_high],  # 1 value - expected high price movement
-            [pred_std_high],  # 1 value - uncertainty in high prediction
-            [pred_mean_low],  # 1 value - expected low price movement
-            [pred_std_low],  # 1 value - uncertainty in low prediction
-            [self.stop_loss_normalized]  # 1 value - current stop-loss threshold (normalized)
-        ])
+        ]
+        
+        # Add model predictions if available
+        if model_outputs:
+            state_components.append(model_outputs)
+            
+        # Add stop-loss
+        state_components.append([self.stop_loss_normalized])
+        
+        state = np.concatenate(state_components)
         
         return state.astype(np.float32)
     
@@ -348,262 +411,203 @@ except ImportError:
             info: Additional information
         """
         # Apply learned risk multiplier if provided
-        # If both variance-adaptive and learnable risk are enabled, they work together:
-        # 1. Variance-adaptive provides base adjustment (in _get_state)
-        # 2. Learned risk multiplier further adjusts (multiplicative)
         if risk_multiplier is not None:
-            # Clamp to reasonable range
             risk_multiplier = max(0.5, min(2.0, risk_multiplier))
-            # Apply learned risk multiplier to current stop-loss
-            # If variance-adaptive is enabled, this multiplies on top of variance adjustment
-            # If not, this multiplies on base stop-loss
             self.current_stop_loss_per_contract = self.current_stop_loss_per_contract * risk_multiplier
-            # Clamp to reasonable range (100-1000)
             self.current_stop_loss_per_contract = max(100.0, min(1000.0, self.current_stop_loss_per_contract))
         
         # Map action to position change
-        position_change = self.action_map[action - 2]  # action: 0->-2, 1->-1, 2->0, 3->1, 4->2
+        position_change = action - self.max_position
         
         # Prevent actions that would exceed position limits
+        ineffective_action_penalty = 0.0
         if self.position <= self.min_position and position_change < 0:
-            # Already at minimum position; cannot sell more
             position_change = 0
+            ineffective_action_penalty = -2.0
         elif self.position >= self.max_position and position_change > 0:
-            # Already at maximum position; cannot buy more
             position_change = 0
+            ineffective_action_penalty = -2.0
+        
+        # Initialize reward with ineffective action penalty
+        reward = ineffective_action_penalty
         
         # Calculate new position
         new_position = self.position + position_change
-        
-        # Clamp position to valid range
         new_position = max(self.min_position, min(self.max_position, new_position))
         actual_change = new_position - self.position
         
-        # Get current price (use Close price for execution)
+        # Get current price
         current_price = self.df.iloc[self.current_step]['Close']
         
-        # Calculate transaction cost: $2.5 per contract traded
+        # Calculate transaction cost
         contracts_traded = abs(actual_change)
         transaction_cost = contracts_traded * self.transaction_cost_per_contract
         
-        # Calculate reward (profit/loss)
-        reward = 0.0
-        old_position = self.position
-        
         # Calculate realized P&L from position change
+        old_position = self.position
+        profitable_trade = False
+        profit_amount = 0.0
+        
         if old_position != 0 and self.avg_entry_price != 0:
-            # Realized P&L when reducing or reversing position
             if (old_position > 0 and actual_change < 0) or (old_position < 0 and actual_change > 0):
-                # Closing or reducing position
                 closed_units = min(abs(old_position), abs(actual_change))
                 if old_position > 0:
-                    # Long position: profit when price goes up
-                    realized_pnl = (current_price - self.avg_entry_price) * closed_units
+                    realized_pnl_val = (current_price - self.avg_entry_price) * closed_units
+                    pnl_per_contract = current_price - self.avg_entry_price
                 else:
-                    # Short position: profit when price goes down
-                    realized_pnl = (self.avg_entry_price - current_price) * closed_units
-                reward += realized_pnl
-                self.total_pnl += realized_pnl
+                    realized_pnl_val = (self.avg_entry_price - current_price) * closed_units
+                    pnl_per_contract = self.avg_entry_price - current_price
+                
+                if pnl_per_contract > 0:
+                    profitable_trade = True
+                    profit_amount = realized_pnl_val
+                
+                reward += realized_pnl_val
+                self.total_pnl += realized_pnl_val
         
-        # Apply transaction cost to reward
+        # Apply transaction cost
         reward -= transaction_cost
         self.total_pnl -= transaction_cost
         
         # Update average entry price and position
         if actual_change > 0:
-            # Buying: reduce cash, add to position (or reduce short)
             cost = actual_change * current_price
             self.cash -= cost
-            
             if old_position == 0:
-                # Starting new long position
                 self.avg_entry_price = current_price
             elif old_position > 0:
-                # Adding to long position - weighted average
                 old_value = self.avg_entry_price * old_position
                 new_cost = actual_change * current_price
                 self.avg_entry_price = (old_value + new_cost) / new_position
             else:
-                # Reducing short position (buying back)
-                if abs(new_position) < abs(old_position):
-                    # Still short, keep entry price
-                    pass
-                else:
-                    # Flipped to long
+                if abs(new_position) >= abs(old_position):
                     self.avg_entry_price = current_price
         elif actual_change < 0:
-            # Selling: increase cash, reduce position (or go short)
             proceeds = abs(actual_change) * current_price
             self.cash += proceeds
-            
             if old_position == 0:
-                # Starting new short position
                 self.avg_entry_price = current_price
             elif old_position < 0:
-                # Adding to short position - weighted average
                 old_value = self.avg_entry_price * abs(old_position)
                 new_cost = abs(actual_change) * current_price
                 self.avg_entry_price = (old_value + new_cost) / abs(new_position)
             else:
-                # Reducing long position (selling)
-                if new_position > 0:
-                    # Still long, keep entry price
-                    pass
-                else:
-                    # Flipped to short
+                if new_position <= 0:
                     self.avg_entry_price = current_price
         
         # Update position
         self.position = new_position
         
-        # Unrealized P&L (mark-to-market)
+        # Unrealized P&L
         if self.position != 0 and self.avg_entry_price != 0:
             if self.position > 0:
-                # Long position
                 unrealized_pnl = (current_price - self.avg_entry_price) * self.position
             else:
-                # Short position
                 unrealized_pnl = (self.avg_entry_price - current_price) * abs(self.position)
         else:
             unrealized_pnl = 0.0
         
-        # Calculate total P&L for risk management
+        # Total P&L and Drawdown
         total_pnl_with_unrealized = self.total_pnl + unrealized_pnl
-        
-        # Update peak P&L for drawdown tracking
         if total_pnl_with_unrealized > self.peak_pnl:
             self.peak_pnl = total_pnl_with_unrealized
-        
-        # Calculate drawdown (how much we've fallen from peak)
         drawdown = self.peak_pnl - total_pnl_with_unrealized
         
-        # RISK MANAGEMENT: Stop-loss mechanism
-        # If unrealized loss per contract exceeds threshold, force close position
-        # Uses adaptive stop-loss if variance_adaptive_risk is enabled
+        # Stop-loss
         stop_loss_triggered = False
         if self.position != 0 and self.avg_entry_price != 0:
             unrealized_loss_per_contract = -unrealized_pnl / abs(self.position) if unrealized_pnl < 0 else 0.0
-            # Use current adaptive stop-loss (updated based on variance)
-            effective_stop_loss = self.current_stop_loss_per_contract
-            if unrealized_loss_per_contract > effective_stop_loss:
-                # Force close position at stop-loss
+            if unrealized_loss_per_contract > self.current_stop_loss_per_contract:
                 stop_loss_triggered = True
                 if self.position > 0:
                     stop_loss_pnl = (current_price - self.avg_entry_price) * self.position
                 else:
                     stop_loss_pnl = (self.avg_entry_price - current_price) * abs(self.position)
-                
-                # Apply transaction cost for closing
                 closing_cost = abs(self.position) * self.transaction_cost_per_contract
                 stop_loss_pnl -= closing_cost
-                
                 reward += stop_loss_pnl
                 self.total_pnl += stop_loss_pnl
-                
-                # Reset position
                 self.position = 0
                 self.avg_entry_price = 0.0
                 unrealized_pnl = 0.0
                 total_pnl_with_unrealized = self.total_pnl
         
-        # RISK MANAGEMENT: Drawdown penalty
-        # Penalize large drawdowns to encourage risk management
-        if drawdown > 0:
-            # Penalty increases quadratically with drawdown
-            drawdown_penalty = -0.001 * (drawdown / 100.0) ** 2
-            reward += drawdown_penalty
+        # Reward Shaping Improvements
+        if profitable_trade and profit_amount > 0:
+            reward += 0.05 * profit_amount / 100.0
         
-        # RISK MANAGEMENT: Large loss penalty
-        # Strongly penalize episodes with large negative P&L
-        if total_pnl_with_unrealized < -1000.0:
-            large_loss_penalty = -0.01 * abs(total_pnl_with_unrealized) / 100.0
-            reward += large_loss_penalty
+        if actual_change != 0:
+            if not hasattr(self, 'last_trade_step'): self.last_trade_step = -100
+            steps_since_last_trade = self.step_count - self.last_trade_step
+            self.last_trade_step = self.step_count
+            if steps_since_last_trade < 20:
+                reward += -5.0 * (20 - steps_since_last_trade) / 20.0
+        else:
+            if action == self.max_position:
+                if self.position == 0:
+                    reward += 0.01
+                else:
+                    reward += 0.005
         
-        # Total reward: primarily based on realized P&L changes
-        # Add small unrealized P&L component for immediate feedback (reduced weight)
-        # Reward = change in total P&L (realized + small unrealized component) - transaction costs
-        reward += unrealized_pnl * 0.1  # Reduced from 0.5 - tighter coupling to actual P&L
+        # Unrealized P&L change reward
+        if not hasattr(self, 'prev_unrealized_pnl'): self.prev_unrealized_pnl = 0.0
+        unrealized_pnl_change = unrealized_pnl - self.prev_unrealized_pnl
+        self.prev_unrealized_pnl = unrealized_pnl
+        if self.position == 0: self.prev_unrealized_pnl = 0.0
+        reward += unrealized_pnl_change * 0.1
         
-        # Scale reward to prevent Q-value explosion (divide by 100 to normalize)
-        # SPX prices are typically 3000-5000, so P&L can be large
-        # Scale down to make Q-values more stable
-        reward = reward / 100.0
-        
-        # Clip reward to reasonable range for stability
-        # This prevents extreme rewards from destabilizing training
+        # Final reward scaling and clipping
+        reward = reward / 20.0
         reward = np.clip(reward, -5.0, 5.0)
         
         # Move to next step
         self.current_step += 1
         self.step_count += 1
         
-        # Check if done: max steps reached, end of data, max loss exceeded, or drawdown too large
+        # Done check
         done = False
-        if self.step_count >= self.max_steps_per_episode:
-            done = True
-        elif self.current_step >= len(self.df) - 1:
-            done = True
-        elif total_pnl_with_unrealized <= self.max_loss_per_episode:
-            # Early termination if loss exceeds threshold
-            done = True
-        elif drawdown > self.max_drawdown_per_episode:
-            # Early termination if drawdown exceeds threshold
-            done = True
-        elif stop_loss_triggered:
-            # Episode ends after stop-loss is triggered (position closed)
-            done = True
+        if self.step_count >= self.max_steps_per_episode: done = True
+        elif self.current_step >= len(self.df) - 1: done = True
+        elif total_pnl_with_unrealized <= self.max_loss_per_episode: done = True
+        elif drawdown > self.max_drawdown_per_episode: done = True
+        elif stop_loss_triggered: done = True
         
-        # Get next state
-        if not done:
-            next_state = self._get_state()
-        else:
-            # Final state: close all positions
+        # Terminal P&L and reason
+        if done:
             if self.position != 0:
                 final_price = self.df.iloc[-1]['Close']
                 if self.avg_entry_price != 0:
-                    # Calculate final P&L
                     if self.position > 0:
-                        # Long position
                         final_pnl = (final_price - self.avg_entry_price) * self.position
                     else:
-                        # Short position
                         final_pnl = (self.avg_entry_price - final_price) * abs(self.position)
-                    
-                    # Apply transaction cost for closing position
-                    closing_cost = abs(self.position) * self.transaction_cost_per_contract
-                    final_pnl -= closing_cost
-                    
+                    final_pnl -= abs(self.position) * self.transaction_cost_per_contract
                     reward += final_pnl
                     self.total_pnl += final_pnl
                 self.position = 0
                 self.avg_entry_price = 0.0
-                self.position_value = 0.0
             
-            # Use last valid state
-            next_state = self._get_state()
-        
-        # total_pnl_with_unrealized already calculated above for risk management
-        # Determine termination reason
+            # Symmetrical terminal reward
+            if total_pnl_with_unrealized > 0:
+                reward += 5.0 * (total_pnl_with_unrealized / 1000.0)
+            else:
+                reward += -5.0 * (abs(total_pnl_with_unrealized) / 1000.0)
+                
         termination_reason = None
         if done:
-            if stop_loss_triggered:
-                termination_reason = 'stop_loss'
-            elif drawdown > self.max_drawdown_per_episode:
-                termination_reason = 'max_drawdown'
-            elif self.step_count >= self.max_steps_per_episode:
-                termination_reason = 'max_steps'
-            elif self.current_step >= len(self.df) - 1:
-                termination_reason = 'end_of_data'
-            elif total_pnl_with_unrealized <= self.max_loss_per_episode:
-                termination_reason = 'max_loss'
+            if stop_loss_triggered: termination_reason = 'stop_loss'
+            elif drawdown > self.max_drawdown_per_episode: termination_reason = 'max_drawdown'
+            elif self.step_count >= self.max_steps_per_episode: termination_reason = 'max_steps'
+            elif self.current_step >= len(self.df) - 1: termination_reason = 'end_of_data'
+            elif total_pnl_with_unrealized <= self.max_loss_per_episode: termination_reason = 'max_loss'
         
         info = {
             'step': self.current_step,
             'step_count': self.step_count,
             'position': self.position,
             'cash': self.cash,
-            'total_pnl': self.total_pnl,  # Realized P&L only
-            'total_pnl_with_unrealized': total_pnl_with_unrealized,  # Realized + Unrealized
+            'total_pnl': self.total_pnl,
+            'total_pnl_with_unrealized': total_pnl_with_unrealized,
             'unrealized_pnl': unrealized_pnl,
             'price': current_price,
             'transaction_cost': transaction_cost,
@@ -613,6 +617,7 @@ except ImportError:
             'stop_loss_triggered': stop_loss_triggered
         }
         
+        next_state = self._get_state() if not done else self._get_state()
         return next_state, reward, done, info
 
 

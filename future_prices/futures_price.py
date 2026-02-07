@@ -215,6 +215,11 @@ def process_stock_indicators(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
     # Calculate current percent changes
     df = calculate_current_percent_changes(df)
     
+    # Calculate ATR for volatility measurement
+    df = calculate_atr(df, period=7)
+    df = calculate_atr(df, period=14)
+    df = calculate_atr(df, period=28)
+    
     # Skip first 50 values (to avoid NaN from rolling windows)
     if len(df) > 50:
         df = df.iloc[50:].reset_index(drop=True)
@@ -368,6 +373,28 @@ def calculate_current_percent_changes(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def calculate_atr(df: pd.DataFrame, period: int = 14) -> pd.DataFrame:
+    """Calculate Average True Range (ATR)"""
+    df = df.copy()
+    
+    high = df['High']
+    low = df['Low']
+    close = df['Close']
+    
+    # Calculate True Range (TR)
+    # TR = max(high-low, abs(high-close_prev), abs(low-close_prev))
+    tr1 = high - low
+    tr2 = (high - close.shift(1)).abs()
+    tr3 = (low - close.shift(1)).abs()
+    
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    
+    # Calculate ATR (using simple moving average of TR)
+    df[f'ATR_{period}'] = tr.rolling(window=period).mean()
+    
+    return df
+
+
 def calculate_trading_hours(df: pd.DataFrame) -> pd.DataFrame:
     """Calculate hours from start of formal trading (9 AM ET) and overnight trading (6 PM ET)"""
     df = df.copy()
@@ -421,6 +448,65 @@ def calculate_trading_hours(df: pd.DataFrame) -> pd.DataFrame:
         # Calculate hours from overnight trading start
         hours_from_overnight = (time_et - overnight_start).total_seconds() / 3600.0
         df.at[idx, 'Hours_From_Overnight_Trading'] = hours_from_overnight
+    
+    return df
+
+
+def extract_cyclical_time_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Extract cyclical time features (hour, day, month) from datetime columns.
+    
+    This function adds sin/cos encoded time features to the dataframe:
+    - hour_sin, hour_cos (if sub-daily data)
+    - day_sin, day_cos (day of week)
+    - month_sin, month_cos (month of year)
+    
+    Args:
+        df: DataFrame with datetime columns (DateTime_ET, DateTime, or Date)
+    
+    Returns:
+        DataFrame with added cyclical time features
+    """
+    # Prefer DateTime_ET, fallback to DateTime, then Date
+    date_col = None
+    if 'DateTime_ET' in df.columns:
+        date_col = 'DateTime_ET'
+    elif 'DateTime' in df.columns:
+        date_col = 'DateTime'
+    elif 'Date' in df.columns:
+        date_col = 'Date'
+        
+    if date_col:
+        print(f"Extracting cyclical time features from {date_col}...")
+        try:
+            # Convert to datetime
+            dt_series = pd.to_datetime(df[date_col], errors='coerce')
+            
+            # Extract features and apply cyclical encoding (sin/cos)
+            
+            # 1. Hour of day (0-23)
+            hour_values = dt_series.dt.hour.fillna(0)
+            df['hour_sin'] = np.sin(2 * np.pi * hour_values / 24)
+            df['hour_cos'] = np.cos(2 * np.pi * hour_values / 24)
+            if hour_values.nunique() > 1:
+                print("  -> Added hour_sin/cos (variable)")
+            else:
+                print("  -> Added hour_sin/cos (constant - no sub-daily variation)")
+                
+            # 2. Day of week (0-6)
+            dayofweek_values = dt_series.dt.dayofweek.fillna(0)
+            df['day_sin'] = np.sin(2 * np.pi * dayofweek_values / 7)
+            df['day_cos'] = np.cos(2 * np.pi * dayofweek_values / 7)
+            print("  -> Added day_sin/cos")
+            
+            # 3. Month of year (1-12)
+            month_values = dt_series.dt.month.fillna(1)
+            df['month_sin'] = np.sin(2 * np.pi * month_values / 12)
+            df['month_cos'] = np.cos(2 * np.pi * month_values / 12)
+            print("  -> Added month_sin/cos")
+            
+        except Exception as e:
+            print(f"Warning: Could not extract time features: {e}")
     
     return df
 
@@ -638,6 +724,9 @@ def main():
         print("Calculating trading hours...")
         # Calculate hours from formal trading (9 AM ET) and overnight trading (6 PM ET)
         df = calculate_trading_hours(df)
+        
+        # Extract cyclical time features (hour, day, month sin/cos)
+        df = extract_cyclical_time_features(df)
         
         # Process all technical indicators using the shared function
         initial_len = len(df)
