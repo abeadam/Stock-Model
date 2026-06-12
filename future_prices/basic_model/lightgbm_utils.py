@@ -253,6 +253,12 @@ def prepare_features_and_target(df, target_column='PctChange_CloseToHigh'):
         'MFI_7',
         'MFI_14',
         'MFI_28',
+        'ASI_Bull_7',
+        'ASI_Bear_7',
+        'ASI_Bull_14',
+        'ASI_Bear_14',
+        'ASI_Bull_28',
+        'ASI_Bear_28',
         'ATR_14',
         'VXM_Open',
         'VXM_High',
@@ -917,9 +923,12 @@ def run_top_n_feature_search(
     top_n_candidates,
     n_folds=5,
     sample_size=None,
+    importance_csv_path=None,
 ):
     """
-    Grid search over number of top features (by |correlation| with target).
+    Grid search over number of top features. Uses gain from importance CSV when
+    importance_csv_path is provided and the file exists; otherwise uses top N by |correlation|.
+
     Runs k-fold CV for each candidate N and picks the one with best mean R².
 
     Args:
@@ -933,25 +942,43 @@ def run_top_n_feature_search(
         top_n_candidates: List of int or None, e.g. [None, 10, 20, 30] (None = all features)
         n_folds: Number of folds for each CV run
         sample_size: Optional sample size for train_lightgbm
+        importance_csv_path: Optional path to feature_importances_splits_and_gain.csv; when present, use top N by gain instead of correlation
 
     Returns:
         best_n: Chosen N (None = use all features)
         best_r2: Mean CV R² for best_n
         results: List of (n, r2) for each candidate tried
     """
+    use_gain = importance_csv_path is not None and Path(importance_csv_path).exists()
+    gain_ranked_features = None
+    if use_gain:
+        assert importance_csv_path is not None
+        # Load once so the feature ordering is stable across candidates
+        # (and not affected by any external rewrite mid-search).
+        df_imp = pd.read_csv(importance_csv_path)
+        if "feature" not in df_imp.columns:
+            use_gain = False
+        else:
+            gain_ranked_features = df_imp["feature"].tolist()
     print("\n" + "=" * 60)
-    print("Grid search: optimizing number of top features (by |correlation|)")
+    print("Grid search: optimizing number of top features (by gain from CSV)" if use_gain else "Grid search: optimizing number of top features (by |correlation|)")
     print("=" * 60)
     best_n = None
     best_r2 = -np.inf
     results = []
     for n in top_n_candidates:
-        if n is not None and len(correlations) < n:
-            continue
         if n is not None:
-            top_names = [name for name, _ in correlations[:n]]
-            col_indices = [feature_cols.index(name) for name in top_names]
-            X_sub = X[:, col_indices]
+            if use_gain:
+                if gain_ranked_features is None or len(gain_ranked_features) < n:
+                    continue
+                top_names = gain_ranked_features[:n]
+                X_sub, _ = apply_top_n_features_by_names(X, feature_cols, top_names)
+            else:
+                if len(correlations) < n:
+                    continue
+                top_names = [name for name, _ in correlations[:n]]
+                col_indices = [feature_cols.index(name) for name in top_names]
+                X_sub = X[:, col_indices]
             kwargs = {**base_train_kwargs, "lambda_l1": 0.0, "lambda_l2": 0.05}
         else:
             X_sub = X
@@ -979,6 +1006,35 @@ def run_top_n_feature_search(
     return best_n, best_r2, results
 
 
+def load_top_n_features_from_importance_csv(csv_path, top_n):
+    """
+    Load top N feature names from a feature_importances_splits_and_gain CSV (sorted by gain).
+    Returns list of feature names, or None if file does not exist or has fewer than top_n rows.
+    """
+    if not Path(csv_path).exists():
+        return None
+    df = pd.read_csv(csv_path)
+    if "feature" not in df.columns or len(df) < top_n:
+        return None
+    return df["feature"].head(top_n).tolist()
+
+
+def apply_top_n_features_by_names(X, feature_cols, top_names):
+    """
+    Subset X and feature_cols to the given feature names (order preserved).
+    Only includes names that exist in feature_cols; skips missing ones.
+
+    Returns:
+        X_sub: Feature matrix (possibly subset)
+        feature_cols_sub: List of feature names (subset, order as in top_names)
+    """
+    found = [n for n in top_names if n in feature_cols]
+    if not found:
+        return X, feature_cols
+    col_indices = [feature_cols.index(n) for n in found]
+    return X[:, col_indices], found
+
+
 def apply_top_n_features(X, correlations, feature_cols, top_n):
     """
     Subset X and feature_cols to top top_n features by |correlation|.
@@ -993,6 +1049,43 @@ def apply_top_n_features(X, correlations, feature_cols, top_n):
     top_names = [name for name, _ in correlations[:top_n]]
     col_indices = [feature_cols.index(name) for name in top_names]
     return X[:, col_indices], top_names
+
+
+def apply_top_n_features_from_csv_or_correlation(
+    X, feature_cols, correlations, importance_csv_path, top_n, verbose=True
+):
+    """
+    Use top_n features: prefer names from importance CSV (by gain), else top_n by |correlation|.
+    Prints which source was used when verbose=True.
+
+    Returns:
+        X_sub: Feature matrix (possibly subset)
+        feature_cols_sub: List of feature names (possibly subset)
+        applied_subset: True if a feature subset was applied (caller may set L1/L2)
+    """
+    if top_n is None:
+        if verbose:
+            print(f"\n  Using all features.")
+        return X, feature_cols, False
+
+    top_names = load_top_n_features_from_importance_csv(importance_csv_path, top_n)
+    if top_names is not None:
+        X, feature_cols = apply_top_n_features_by_names(X, feature_cols, top_names)
+        if verbose:
+            print(f"\n  Using top {top_n} features by gain from {Path(importance_csv_path).name}:")
+            print(f"    Selected {len(feature_cols)} features")
+        return X, feature_cols, True
+
+    if len(correlations) >= top_n:
+        X, feature_cols = apply_top_n_features(X, correlations, feature_cols, top_n)
+        if verbose:
+            print(f"\n  Importance CSV not found or too short; using top {top_n} features by |correlation|:")
+            print(f"    Selected {len(feature_cols)} features")
+        return X, feature_cols, True
+
+    if verbose:
+        print(f"\n  Importance CSV not found and fewer than {top_n} features; using all features.")
+    return X, feature_cols, False
 
 
 def run_kfold_cv(
@@ -1093,7 +1186,7 @@ def run_kfold_cv(
     return metrics_mean, metrics_std, oof_y_true, oof_y_pred, cv_metrics_list
 
 
-def write_metrics_file(path, title, n_folds, metrics_mean, metrics_std, train_metrics):
+def write_metrics_file(path, title, n_folds, metrics_mean, metrics_std, train_metrics, top_n_search=None):
     """
     Write metrics summary to a text file (CV mean±std and final model on full data).
 
@@ -1104,10 +1197,30 @@ def write_metrics_file(path, title, n_folds, metrics_mean, metrics_std, train_me
         metrics_mean: Dict from run_kfold_cv
         metrics_std: Dict from run_kfold_cv
         train_metrics: Dict from evaluate_model on full data
+        top_n_search: Optional dict with keys:
+            - best_n: int | None
+            - best_r2: float
+            - results: list[tuple[int|None, float]]
     """
     with open(path, 'w') as f:
         f.write(f"{title}\n")
         f.write("=" * 60 + "\n\n")
+        if top_n_search is not None:
+            f.write("TOP-N FEATURE SEARCH (candidate CV R²):\n")
+            f.write("-" * 60 + "\n")
+            best_n = top_n_search.get("best_n")
+            best_r2 = top_n_search.get("best_r2")
+            selected_feature_count = top_n_search.get("selected_feature_count")
+            results = top_n_search.get("results", [])
+            best_label = "all" if best_n is None else str(best_n)
+            if best_r2 is not None:
+                f.write(f"Best TOP_N: {best_label} (CV R² = {best_r2:.4f})\n")
+            if selected_feature_count is not None:
+                f.write(f"Selected features (best): {selected_feature_count}\n")
+            for n, r2 in results:
+                label = "all" if n is None else str(n)
+                f.write(f"  TOP_N={label:>3} -> CV R² = {r2:.4f}\n")
+            f.write("\n")
         f.write(f"{n_folds}-FOLD CROSS-VALIDATION (mean ± std):\n")
         f.write("-" * 60 + "\n")
         f.write(f"MSE:   {metrics_mean['mse']:.6f} ± {metrics_std['mse']:.6f} (%²)\n")

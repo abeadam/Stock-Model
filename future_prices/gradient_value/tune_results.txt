@@ -1,0 +1,21 @@
+Gradient classifier hyperparameter tuning
+============================================================
+Random search: 24 candidates, select by validation AUC.
+Features: 38 (best_plus_asi)
+
+Untuned baseline (test): AUC=0.6379  LogLoss=0.6542  Dir%=61.04
+
+Best params: {'num_leaves': 511, 'max_depth': -1, 'learning_rate': 0.05, 'min_data_in_leaf': 200, 'feature_fraction': 0.9, 'bagging_fraction': 0.6, 'lambda_l1': 0.0, 'lambda_l2': 0.05}
+Trees (final): 395
+
+Retuned model — TEST block (last 20%, unseen):
+  AUC:      0.6932
+  LogLoss:  0.6207
+  Dir%:     64.44
+
+Top 5 candidates by validation AUC:
+  AUC=0.6564 trees= 159  {'num_leaves': 511, 'max_depth': -1, 'learning_rate': 0.05, 'min_data_in_leaf': 200, 'feature_fraction': 0.9, 'bagging_fraction': 0.6, 'lambda_l1': 0.0, 'lambda_l2': 0.05}
+  AUC=0.6549 trees=2230  {'num_leaves': 255, 'max_depth': -1, 'learning_rate': 0.005, 'min_data_in_leaf': 50, 'feature_fraction': 0.7, 'bagging_fraction': 0.7, 'lambda_l1': 0.1, 'lambda_l2': 0.5}
+  AUC=0.6545 trees= 317  {'num_leaves': 511, 'max_depth': 12, 'learning_rate': 0.03, 'min_data_in_leaf': 100, 'feature_fraction': 1.0, 'bagging_fraction': 0.7, 'lambda_l1': 0.05, 'lambda_l2': 0.1}
+  AUC=0.6535 trees= 583  {'num_leaves': 255, 'max_depth': 12, 'learning_rate': 0.02, 'min_data_in_leaf': 50, 'feature_fraction': 0.7, 'bagging_fraction': 0.9, 'lambda_l1': 0.05, 'lambda_l2': 0.05}
+  AUC=0.6534 trees=1485  {'num_leaves': 127, 'max_depth': -1, 'learning_rate': 0.01, 'min_data_in_leaf': 1000, 'feature_fraction': 0.8, 'bagging_fraction': 0.7, 'lambda_l1': 0.1, 'lambda_l2': 0.1}

@@ -1,0 +1,21 @@
+{
+  "best_params": {
+    "bagging_fraction": 0.7956488938538635,
+    "bagging_freq": 5,
+    "feature_fraction": 0.9661638227728979,
+    "lambda_l1": 0.04822149251619493,
+    "lambda_l2": 0.06079712296915085,
+    "learning_rate": 0.07232447872229951,
+    "max_depth": 6,
+    "min_data_in_leaf": 8,
+    "n_estimators": 7885,
+    "num_leaves": 4095
+  },
+  "best_score": -0.02647107183526549,
+  "best_score_std": 0.019863000043145448,
+  "n_splits": 2,
+  "scoring": "neg_mean_squared_error",
+  "search_type": "random",
+  "timestamp": "20260210_004858",
+  "n_candidates": 50
+}

@@ -1,8 +1,9 @@
 """
-LightGBM Model for PctChange_CloseToHigh (lightgbm_model_highest)
+LightGBM Model for PctChange_ToMaxHigh_5 (lightgbm_model_highest)
 
-Predicts the value of the PctChange_CloseToHigh column (percentage change from
-Close to High within the same bar). Outputs: lightgbm_model_highest.pkl, etc.
+Predicts the max percentage change from current Close to the highest High in the
+next 5 bars (PctChange_ToMaxHigh_5 column in es_with_indicators.csv).
+Outputs: lightgbm_model_highest.pkl, etc.
 """
 
 import json
@@ -25,11 +26,11 @@ from lightgbm_utils import (
     unscale_target,
     evaluate_model,
     get_feature_importance,
+    apply_top_n_features_from_csv_or_correlation,
     plot_predictions_vs_actual,
     run_correlation_analysis,
     run_kfold_cv,
     run_top_n_feature_search,
-    apply_top_n_features,
     write_metrics_file,
 )
 
@@ -48,7 +49,7 @@ def main():
     SAMPLE_SIZE = None  # Start small for quick testing, then set to None for full training
     # Recommended progression: 1000 -> 10000 -> 100000 -> None (full dataset)
     
-    # Model parameters (from lightgbm_best_params_random_20260202_093117.json)
+    # Model parameters (from lightgbm_model_highest_best_params_random_20260210_004858.json)
     if SAMPLE_SIZE and SAMPLE_SIZE < 10000:
         # Smaller model for small datasets to prevent overfitting
         N_ESTIMATORS = 500
@@ -59,17 +60,17 @@ def main():
         BAGGING_FREQ = 1
         print(f"  Using smaller model parameters for sample size {SAMPLE_SIZE}")
     else:
-        N_ESTIMATORS = 1600
-        MAX_DEPTH = 8
-        NUM_LEAVES = 511
-        LEARNING_RATE = 0.012036847570290075
-        MIN_DATA_IN_LEAF = 11
-        BAGGING_FREQ = 1
+        N_ESTIMATORS = 7885
+        MAX_DEPTH = 6
+        NUM_LEAVES = 4095
+        LEARNING_RATE = 0.07232447872229951
+        MIN_DATA_IN_LEAF = 8
+        BAGGING_FREQ = 5
     
-    FEATURE_FRACTION = 0.9458480547239904
-    BAGGING_FRACTION = 0.7938194534317411
-    LAMBDA_L1 = 0.0515137118615616
-    LAMBDA_L2 = 0.27818644082591015
+    FEATURE_FRACTION = 0.9661638227728979
+    BAGGING_FRACTION = 0.7956488938538635
+    LAMBDA_L1 = 0.04822149251619493
+    LAMBDA_L2 = 0.06079712296915085
     MIN_GAIN_TO_SPLIT = 0.0  # Allow splits even with tiny gains (important for small targets)
     
     # CPU parallelization (optimized for Mac)
@@ -83,11 +84,12 @@ def main():
     
     # Grid search over number of top features (by |correlation| with target)
     SEARCH_TOP_N_FEATURES = True   # If True, optimize USE_TOP_N_FEATURES via CV; else use fixed value below
-    TOP_N_CANDIDATES = [None, 10, 15, 20, 25, 30, 40, 50]  # None = use all features
-    N_FOLDS_TOP_N_SEARCH = 5       # Folds used when searching TOP_N (fewer = faster)
+    TOP_N_CANDIDATES = [None, 20, 30, 40, 60, 80]  # None = use all features
+    N_FOLDS_TOP_N_SEARCH = 3       # Folds used when searching TOP_N (fewer = faster)
     
-    # Used only when SEARCH_TOP_N_FEATURES is False
-    USE_TOP_N_FEATURES = None  # None = use all features; 20 = train on top 20 by |corr| with target
+    # Use ALL features so inference in prepare_data.py can call prepare_features_and_target
+    # and pass the matrix directly without any positional-order ambiguity.
+    USE_TOP_N_FEATURES = 30  # None = use all features
     
     # Base train kwargs (L1/L2 may be overridden when using limited feature set)
     base_train_kwargs = dict(
@@ -108,45 +110,55 @@ def main():
     )
     
     print("=" * 60)
-    print("LightGBM Model (highest): PctChange_CloseToHigh")
+    print("LightGBM Model (highest): PctChange_ToMaxHigh_5")
     print("=" * 60)
-    
-    # Load data
+
+    # Load data (PctChange_ToMaxHigh_5 is pre-computed in es_with_indicators.csv)
     df = load_data(csv_path, sample_size=SAMPLE_SIZE)
-    
+
     # Prepare features and target
     X, y, feature_cols, TARGET_SCALE, SCALING_METHOD, y_original = prepare_features_and_target(
-        df, target_column='PctChange_CloseToHigh'
+        df, target_column='PctChange_ToMaxHigh_5'
     )
     
     # Feature-target correlations (using original unscaled target)
     corr_file = Path(__file__).parent / f'{MODEL_BASE}_feature_correlations.csv'
     correlations = run_correlation_analysis(X, y_original, feature_cols, corr_file)
 
-    # Option to use only top N features by absolute correlation (reduces noise, may help R²)
+    # Option to use only top N features (by gain from CSV when available, else by |correlation|)
+    importance_csv = Path(__file__).parent / f'{MODEL_BASE}_feature_importances_splits_and_gain.csv'
+    top_n_search_summary = None
     if SEARCH_TOP_N_FEATURES:
-        USE_TOP_N_FEATURES, _, _ = run_top_n_feature_search(
+        USE_TOP_N_FEATURES, best_r2, top_n_results = run_top_n_feature_search(
             X, y, correlations, feature_cols,
             TARGET_SCALE, SCALING_METHOD,
             base_train_kwargs,
             TOP_N_CANDIDATES,
             n_folds=N_FOLDS_TOP_N_SEARCH,
             sample_size=SAMPLE_SIZE,
+            importance_csv_path=importance_csv,
         )
-        X, feature_cols = apply_top_n_features(X, correlations, feature_cols, USE_TOP_N_FEATURES)
-        if USE_TOP_N_FEATURES is not None:
+        top_n_search_summary = {
+            "best_n": USE_TOP_N_FEATURES,
+            "best_r2": best_r2,
+            "results": top_n_results,
+        }
+        X, feature_cols, applied_subset = apply_top_n_features_from_csv_or_correlation(
+            X, feature_cols, correlations, importance_csv, USE_TOP_N_FEATURES
+        )
+        top_n_search_summary["selected_feature_count"] = len(feature_cols)
+        if applied_subset:
             LAMBDA_L1 = 0.0
             LAMBDA_L2 = 0.05
-            print(f"  Using top {USE_TOP_N_FEATURES} features; L1=0, L2={LAMBDA_L2}")
-        else:
-            print(f"  Using all features")
-    elif USE_TOP_N_FEATURES is not None and len(correlations) >= USE_TOP_N_FEATURES:
-        X, feature_cols = apply_top_n_features(X, correlations, feature_cols, USE_TOP_N_FEATURES)
-        print(f"\n  Using top {USE_TOP_N_FEATURES} features by |correlation| with target:")
-        print(f"    {feature_cols}")
-        LAMBDA_L1 = 0.0
-        LAMBDA_L2 = 0.05
-        print(f"  L1=0, L2={LAMBDA_L2} (reduced regularization for limited feature set)")
+            print(f"  L1=0, L2={LAMBDA_L2} (reduced regularization for limited feature set)")
+    elif USE_TOP_N_FEATURES is not None:
+        X, feature_cols, applied_subset = apply_top_n_features_from_csv_or_correlation(
+            X, feature_cols, correlations, importance_csv, USE_TOP_N_FEATURES
+        )
+        if applied_subset:
+            LAMBDA_L1 = 0.0
+            LAMBDA_L2 = 0.05
+            print(f"  L1=0, L2={LAMBDA_L2} (reduced regularization for limited feature set)")
     
     # Option to use hyperparameter tuning
     USE_GRID_SEARCH = False  # Set to True to enable hyperparameter tuning
@@ -170,16 +182,16 @@ def main():
             # Tuned around last best (20260201): n_est 1004, depth 10, leaves 511, lr 0.017,
             # feat_frac 0.95, bag_frac 0.78, L1 0.036, L2 0.13, min_leaf 13, bag_freq 1
             param_distributions = {
-                'n_estimators': randint(800, 2200),   # Narrow around 1004; early stop ~300-500
-                'max_depth': randint(8, 13),          # Best 10; top CV 8-13
-                'num_leaves': [255, 511, 1023],      # Best 511; drop 127
-                'learning_rate': uniform(0.008, 0.018),  # Best 0.017; ~0.008-0.026
-                'feature_fraction': uniform(0.88, 0.12),  # Best 0.95; 0.88-1.0
-                'bagging_fraction': uniform(0.72, 0.26),  # Best 0.78; 0.72-0.98
-                'bagging_freq': [0, 1, 5],
-                'lambda_l1': uniform(0.01, 0.06),    # Best 0.036; low L1
-                'lambda_l2': uniform(0.05, 0.35),    # Best 0.13; avoid very high L2
-                'min_data_in_leaf': randint(8, 16), # Best 13; 8-15
+                'n_estimators': randint(500, 10000),   # Narrow around 1004; early stop ~300-500
+                'max_depth': randint(6, 64),          # Best 10; top CV 8-13
+                'num_leaves': [63, 255, 511, 1023, 2047, 4095],      # Best 511; drop 127
+                'learning_rate': uniform(0.001, 0.1),  # [0.001, 0.101]
+                'feature_fraction': uniform(0.7, 0.3),  # [0.88, 1.0]
+                'bagging_fraction': uniform(0.5, 0.5),  # [0.72, 0.98]
+                'bagging_freq': [0, 1, 2, 3, 4, 5],
+                'lambda_l1': uniform(0.001, 0.1),    # [0.01, 0.07]
+                'lambda_l2': uniform(0.001, 0.5),    # [0.05, 0.40]
+                'min_data_in_leaf': randint(4, 64), # Best 13; 8-15
             }
             print("  Using HalvingRandomSearchCV - exploring wider parameter ranges")
         else:
@@ -428,7 +440,8 @@ def main():
     metrics_path = model_dir / f'{MODEL_BASE}_metrics.txt'
     write_metrics_file(
         metrics_path, "LightGBM Model (highest) Metrics - PctChange_CloseToHigh",
-        N_FOLDS, metrics_mean, metrics_std, train_metrics
+        N_FOLDS, metrics_mean, metrics_std, train_metrics,
+        top_n_search=top_n_search_summary,
     )
     print(f"Metrics saved to {metrics_path}")
     

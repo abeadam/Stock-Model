@@ -1,0 +1,39 @@
+LightGBM Binary Classifier — Direction of Avg Next-5-Bar Close % Change
+======================================================================
+Target: 1 if mean(next-5-bar close % changes) > 0, else 0
+Loss:   binary log-loss, 500 trees, LR=0.01
+Best feature set: best_plus_asi  (38 features)
+Features: high_close_ratio, low_close_ratio, hour_sin, hour_cos, MFI_14, pred_CloseToHigh, pred_CloseToLow, close_pct_lag1, close_pct_lag2, close_pct_lag3, close_pct_lag4, close_pct_lag5, rolling_vol_5, rolling_vol_20, pred_high_lag1, pred_low_lag1, bb_upper_dist, bb_lower_dist, ema10_dist, ema20_dist, ema50_dist, ema_cross, asi_bull_7, asi_bear_7, asi_bull_14, asi_bear_14, asi_bull_28, asi_bear_28, asi_bull_14_lag1, asi_bull_14_lag2, asi_bull_14_lag3, asi_bull_14_lag4, asi_bull_14_lag5, asi_bear_14_lag1, asi_bear_14_lag2, asi_bear_14_lag3, asi_bear_14_lag4, asi_bear_14_lag5
+
+Split:
+  Train: 2,982,317 rows (first 80%)
+  Test:  745,580 rows (last 20%)
+
+FEATURE SET SWEEP — Test metrics:
+----------------------------------------------------------------------
+
+  [best_so_far]
+    Dir%:    60.55%
+    AUC:     0.6300
+    LogLoss: 0.6567
+    ECE:     0.0732
+
+  [best_plus_asi]  ← BEST
+    Dir%:    61.04%
+    AUC:     0.6379
+    LogLoss: 0.6542
+    ECE:     0.0734
+
+BEST MODEL TRAINING SET:
+----------------------------------------
+  Directional acc: 62.30%
+  AUC-ROC:         0.6732
+  Log loss:        0.6396
+  ECE:             0.0604
+
+BEST MODEL TEST SET (last 20% — unseen):
+----------------------------------------
+  Directional acc: 61.04%
+  AUC-ROC:         0.6379
+  Log loss:        0.6542
+  ECE:             0.0734

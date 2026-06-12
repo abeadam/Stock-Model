@@ -280,6 +280,25 @@ def calculate_current_percent_changes(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def calculate_forward_percent_changes(df: pd.DataFrame, periods: int = 5) -> pd.DataFrame:
+    """Vectorized: percent change from current Close to max High / min Low of next N bars.
+
+    Row t = (max/min of High/Low in bars t+1 … t+periods − Close[t]) / Close[t] * 100.
+    Last `periods` rows are NaN (no forward data available).
+    Must be called on the full merged dataframe (not per-chunk).
+    """
+    df = df.copy()
+    shifts = range(1, periods + 1)
+
+    max_future_high = pd.concat([df['High'].shift(-i) for i in shifts], axis=1).max(axis=1)
+    min_future_low  = pd.concat([df['Low'].shift(-i)  for i in shifts], axis=1).min(axis=1)
+
+    df['PctChange_ToMaxHigh_5'] = (max_future_high - df['Close']) / df['Close'] * 100
+    df['PctChange_ToMinLow_5']  = (min_future_low  - df['Close']) / df['Close'] * 100
+
+    return df
+
+
 def calculate_trading_hours(df: pd.DataFrame) -> pd.DataFrame:
     """Calculate hours from start of formal trading (9 AM ET) and overnight trading (6 PM ET)"""
     df = df.copy()
@@ -815,7 +834,13 @@ def main():
         all_files = [es_output, vxm_output] + stock_outputs
         final_output = os.path.join(script_dir, 'es_with_indicators.csv')
         df_final = merge_dataframes_chunked(all_files, final_output)
-        
+
+        # Add forward-looking percent-change targets (requires the full merged df)
+        print("\nCalculating forward percent changes (vectorized, full dataset)...")
+        df_final = calculate_forward_percent_changes(df_final, periods=5)
+        df_final.to_csv(final_output, index=False)
+        print(f"Forward targets added and saved to {final_output}")
+
         # Generate summary statistics (on sample if too large)
         print("\n=== Summary Statistics ===")
         if len(df_final) > 100000:

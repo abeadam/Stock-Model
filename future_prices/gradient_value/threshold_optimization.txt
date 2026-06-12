@@ -1,0 +1,32 @@
+Threshold optimization — gradient ES strategy
+============================================================
+Validation = first 50% of test window; reported on the rest.
+Cost per fill: $15.00 (commission + slippage)
+
+Top 8 configurations by validation net P&L:
+  policy    buy   sell     val_net_pnl   val_trades
+   hold   0.75   0.20  $     229,488        9,525
+   hold   0.80   0.25  $     226,932       10,166
+   hold   0.80   0.20  $     224,882        8,246
+   hold   0.75   0.25  $     220,972       12,303
+   hold   0.80   0.30  $     217,012       12,335
+   hold   0.75   0.15  $     212,428        7,157
+   hold   0.80   0.15  $     210,442        6,374
+   hold   0.70   0.20  $     206,922       10,423
+
+Chosen: policy=hold  buy=0.75  sell=0.20
+
+Held-out TEST half with chosen thresholds:
+  Bars:                 372,790
+  Exposure:             100.0%
+  Trades:               8,984
+  Directional accuracy: 53.78%
+  Net P&L:              $360,605.00
+    Gross P&L:          $630,125.00
+    Commission:         $44,920.00
+    Slippage:           $224,600.00
+  Buy & hold:           $-4,550.00
+  Win rate:             68.68%
+  Profit factor:        5.628
+  Sharpe (annualized):  38.68
+  Max drawdown:         $-6,147.50

@@ -1,0 +1,23 @@
+Gradient-value strategy backtest — ES futures
+============================================================
+Rule: p>=0.75 long, p<=0.20 short, else hold (long & short, 'hold' policy)
+Sizing: 1 contract | $50/pt
+Costs:  $2.50 commission + 1.00 tick ($12.50) slippage per fill
+Evaluated on held-out last 20% test split
+
+Bars:                  745,580
+Exposure:              100.0% of bars in market
+Trades:                18,509
+Directional accuracy:  53.71% (active bars, next-bar)
+
+Net P&L:               $590,042.50
+  Gross P&L:           $1,145,312.50
+  Commission:          $92,545.00
+  Slippage:            $462,725.00
+Buy & hold (1 long):   $34,225.00
+
+Win rate:              67.50%
+Avg win / loss:        $111.06 / $-63.60
+Profit factor:         5.728
+Sharpe (annualized):   32.48
+Max drawdown:          $-6,927.50

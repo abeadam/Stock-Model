@@ -1,8 +1,9 @@
 """
-LightGBM Model for PctChange_CloseToLow (lightgbm_model_lowest)
+LightGBM Model for PctChange_ToMinLow_5 (lightgbm_model_lowest)
 
-Predicts the value of the PctChange_CloseToLow column (percentage change from
-Close to Low within the same bar). Outputs: lightgbm_model_lowest.pkl, etc.
+Predicts the min percentage change from current Close to the lowest Low in the
+next 5 bars (PctChange_ToMinLow_5 column in es_with_indicators.csv).
+Outputs: lightgbm_model_lowest.pkl, etc.
 """
 
 import json
@@ -25,11 +26,11 @@ from lightgbm_utils import (
     unscale_target,
     evaluate_model,
     get_feature_importance,
+    apply_top_n_features_from_csv_or_correlation,
     plot_predictions_vs_actual,
     run_correlation_analysis,
     run_kfold_cv,
     run_top_n_feature_search,
-    apply_top_n_features,
     write_metrics_file,
 )
 
@@ -82,12 +83,13 @@ def main():
     N_FOLDS = 10
     
     # Grid search over number of top features (by |correlation| with target)
-    SEARCH_TOP_N_FEATURES = False   # If True, optimize USE_TOP_N_FEATURES via CV; else use fixed value below
-    TOP_N_CANDIDATES = [24, 25, 26]  # None = use all features
-    N_FOLDS_TOP_N_SEARCH = 5       # Folds used when searching TOP_N (fewer = faster)
-    
-    # Used only when SEARCH_TOP_N_FEATURES is False
-    USE_TOP_N_FEATURES = 20  # None = use all features; 20 = train on top 20 by |corr| with target
+    SEARCH_TOP_N_FEATURES = True  # If True, optimize USE_TOP_N_FEATURES via CV; else use fixed value below
+    TOP_N_CANDIDATES = [None, 20, 30, 40, 60, 80]  # None = use all features
+    N_FOLDS_TOP_N_SEARCH = 3       # Folds used when searching TOP_N (fewer = faster)
+
+    # Use ALL features so inference in prepare_data.py can call prepare_features_and_target
+    # and pass the matrix directly without any positional-order ambiguity.
+    USE_TOP_N_FEATURES = 30  # None = use all features
     
     # Base train kwargs (L1/L2 may be overridden when using limited feature set)
     base_train_kwargs = dict(
@@ -108,45 +110,55 @@ def main():
     )
     
     print("=" * 60)
-    print("LightGBM Model (lowest): PctChange_CloseToLow")
+    print("LightGBM Model (lowest): PctChange_ToMinLow_5")
     print("=" * 60)
-    
-    # Load data
+
+    # Load data (PctChange_ToMinLow_5 is pre-computed in es_with_indicators.csv)
     df = load_data(csv_path, sample_size=SAMPLE_SIZE)
-    
+
     # Prepare features and target
     X, y, feature_cols, TARGET_SCALE, SCALING_METHOD, y_original = prepare_features_and_target(
-        df, target_column='PctChange_CloseToLow'
+        df, target_column='PctChange_ToMinLow_5'
     )
     
     # Feature-target correlations (using original unscaled target)
     corr_file = Path(__file__).parent / f'{MODEL_BASE}_feature_correlations.csv'
     correlations = run_correlation_analysis(X, y_original, feature_cols, corr_file)
 
-    # Option to use only top N features by absolute correlation (reduces noise, may help R²)
+    # Option to use only top N features (by gain from CSV when available, else by |correlation|)
+    importance_csv = Path(__file__).parent / f'{MODEL_BASE}_feature_importances_splits_and_gain.csv'
+    top_n_search_summary = None
     if SEARCH_TOP_N_FEATURES:
-        USE_TOP_N_FEATURES, _, _ = run_top_n_feature_search(
+        USE_TOP_N_FEATURES, best_r2, top_n_results = run_top_n_feature_search(
             X, y, correlations, feature_cols,
             TARGET_SCALE, SCALING_METHOD,
             base_train_kwargs,
             TOP_N_CANDIDATES,
             n_folds=N_FOLDS_TOP_N_SEARCH,
             sample_size=SAMPLE_SIZE,
+            importance_csv_path=importance_csv,
         )
-        X, feature_cols = apply_top_n_features(X, correlations, feature_cols, USE_TOP_N_FEATURES)
-        if USE_TOP_N_FEATURES is not None:
+        top_n_search_summary = {
+            "best_n": USE_TOP_N_FEATURES,
+            "best_r2": best_r2,
+            "results": top_n_results,
+        }
+        X, feature_cols, applied_subset = apply_top_n_features_from_csv_or_correlation(
+            X, feature_cols, correlations, importance_csv, USE_TOP_N_FEATURES
+        )
+        top_n_search_summary["selected_feature_count"] = len(feature_cols)
+        if applied_subset:
             LAMBDA_L1 = 0.0
             LAMBDA_L2 = 0.05
-            print(f"  Using top {USE_TOP_N_FEATURES} features; L1=0, L2={LAMBDA_L2}")
-        else:
-            print(f"  Using all features")
-    elif USE_TOP_N_FEATURES is not None and len(correlations) >= USE_TOP_N_FEATURES:
-        X, feature_cols = apply_top_n_features(X, correlations, feature_cols, USE_TOP_N_FEATURES)
-        print(f"\n  Using top {USE_TOP_N_FEATURES} features by |correlation| with target:")
-        print(f"    {feature_cols}")
-        LAMBDA_L1 = 0.0
-        LAMBDA_L2 = 0.05
-        print(f"  L1=0, L2={LAMBDA_L2} (reduced regularization for limited feature set)")
+            print(f"  L1=0, L2={LAMBDA_L2} (reduced regularization for limited feature set)")
+    elif USE_TOP_N_FEATURES is not None:
+        X, feature_cols, applied_subset = apply_top_n_features_from_csv_or_correlation(
+            X, feature_cols, correlations, importance_csv, USE_TOP_N_FEATURES
+        )
+        if applied_subset:
+            LAMBDA_L1 = 0.0
+            LAMBDA_L2 = 0.05
+            print(f"  L1=0, L2={LAMBDA_L2} (reduced regularization for limited feature set)")
     
     # Option to use hyperparameter tuning
     USE_GRID_SEARCH = False  # Set to True to enable hyperparameter tuning
@@ -429,7 +441,8 @@ def main():
     metrics_path = model_dir / f'{MODEL_BASE}_metrics.txt'
     write_metrics_file(
         metrics_path, "LightGBM Model (lowest) Metrics - PctChange_CloseToLow",
-        N_FOLDS, metrics_mean, metrics_std, train_metrics
+        N_FOLDS, metrics_mean, metrics_std, train_metrics,
+        top_n_search=top_n_search_summary,
     )
     print(f"Metrics saved to {metrics_path}")
     

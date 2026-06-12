@@ -32,3 +32,10 @@ future_prices/es_with_indicators.csv
 
 # Daily data (root-level)
 daily_data/
+
+# Large generated data (regenerable from prepare_data.py)
+future_prices/gradient_value/model_input.csv
+
+# Tool state (Claude Code worktrees, Serena cache)
+.claude/
+.serena/

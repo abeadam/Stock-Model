@@ -10,6 +10,8 @@ Calculates and plots:
 import os
 import pandas as pd
 import numpy as np
+import matplotlib
+matplotlib.use('Agg')  # non-interactive backend — safe for headless runs
 import matplotlib.pyplot as plt
 import glob
 from typing import Optional
@@ -211,7 +213,12 @@ def process_stock_indicators(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
     df = calculate_mfi(df, period=7)
     df = calculate_mfi(df, period=14)
     df = calculate_mfi(df, period=28)
-    
+
+    # Calculate Absolute Strength Index (bull/bear power) for 7, 14, and 28 periods
+    df = calculate_absolute_strength(df, period=7)
+    df = calculate_absolute_strength(df, period=14)
+    df = calculate_absolute_strength(df, period=28)
+
     # Calculate current percent changes
     df = calculate_current_percent_changes(df)
     
@@ -283,7 +290,30 @@ def calculate_rsi(df: pd.DataFrame, period: int = 14, price_col: str = 'Close') 
     rs = avg_gain / avg_loss
     rsi_col = f'RSI_{period}'
     df[rsi_col] = 100 - (100 / (1 + rs))
-    
+
+    return df
+
+
+def calculate_absolute_strength(df: pd.DataFrame, period: int, price_col: str = 'Close') -> pd.DataFrame:
+    """Calculate Absolute Strength Index (ASI) as separate bull / bear power.
+
+    Unlike RSI, which normalizes bull vs bear strength into a bounded ratio, this
+    keeps the absolute magnitudes as two columns:
+      - ASI_Bull_{period}: EMA of up moves   (average upward % return)
+      - ASI_Bear_{period}: EMA of down moves (average downward % return, positive)
+
+    Computed on bar-to-bar percent returns (not raw price differences) so the
+    values stay stationary as the absolute price level drifts.
+    """
+    df = df.copy()
+
+    percent_return = df[price_col].pct_change() * 100
+    up_move = percent_return.clip(lower=0)
+    down_move = (-percent_return).clip(lower=0)
+
+    df[f'ASI_Bull_{period}'] = up_move.ewm(span=period, adjust=False).mean()
+    df[f'ASI_Bear_{period}'] = down_move.ewm(span=period, adjust=False).mean()
+
     return df
 
 
@@ -321,42 +351,20 @@ def calculate_mfi(df: pd.DataFrame, period: int = 14) -> pd.DataFrame:
 
 
 def calculate_forward_percent_changes(df: pd.DataFrame, periods: int = 5) -> pd.DataFrame:
-    """Calculate percent change from current close to max high and min low of next N periods"""
+    """Vectorized: percent change from current Close to max High / min Low of next N bars.
+
+    Row t = (max/min of High/Low in bars t+1 … t+periods − Close[t]) / Close[t] * 100.
+    Last `periods` rows are NaN (no forward data available).
+    """
     df = df.copy()
-    
-    # Initialize arrays for forward-looking calculations
-    max_highs = np.full(len(df), np.nan)
-    min_lows = np.full(len(df), np.nan)
-    
-    # For each row, look forward at the next N periods
-    for i in range(len(df)):
-        # Get the next N periods (i+1 to i+periods)
-        end_idx = min(i + periods + 1, len(df))
-        if i + 1 < len(df):
-            # Get the High and Low values for the next N periods
-            future_highs = df['High'].iloc[i+1:end_idx].values
-            future_lows = df['Low'].iloc[i+1:end_idx].values
-            
-            if len(future_highs) > 0:
-                max_highs[i] = np.max(future_highs)
-            else:
-                max_highs[i] = df['High'].iloc[i]
-            
-            if len(future_lows) > 0:
-                min_lows[i] = np.min(future_lows)
-            else:
-                min_lows[i] = df['Low'].iloc[i]
-        else:
-            # For the last row, use current values
-            max_highs[i] = df['High'].iloc[i]
-            min_lows[i] = df['Low'].iloc[i]
-    
-    # Calculate percent change from current Close to max high (next N periods)
-    df['PctChange_ToMaxHigh_5'] = ((max_highs - df['Close'].values) / df['Close'].values) * 100
-    
-    # Calculate percent change from current Close to min low (next N periods)
-    df['PctChange_ToMinLow_5'] = ((min_lows - df['Close'].values) / df['Close'].values) * 100
-    
+    shifts = range(1, periods + 1)
+
+    max_future_high = pd.concat([df['High'].shift(-i) for i in shifts], axis=1).max(axis=1)
+    min_future_low  = pd.concat([df['Low'].shift(-i)  for i in shifts], axis=1).min(axis=1)
+
+    df['PctChange_ToMaxHigh_5'] = (max_future_high - df['Close']) / df['Close'] * 100
+    df['PctChange_ToMinLow_5']  = (min_future_low  - df['Close']) / df['Close'] * 100
+
     return df
 
 
@@ -706,8 +714,7 @@ def plot_results(df: pd.DataFrame, save_path: Optional[str] = None, last_n_point
     if save_path:
         plt.savefig(save_path, dpi=300, bbox_inches='tight')
         print(f"Plot saved to {save_path}")
-    
-    plt.show()
+    plt.close()
 
 
 def main():
@@ -734,9 +741,9 @@ def main():
         if df.empty:
             raise ValueError("ES data processing failed - insufficient data")
         
-        # Calculate forward percent changes (ES only)
-        # print("Calculating forward percent changes for ES...")
-        # df = calculate_forward_percent_changes(df, periods=5)
+        # Calculate forward percent changes (ES only, vectorized)
+        print("Calculating forward percent changes for ES...")
+        df = calculate_forward_percent_changes(df, periods=5)
         
         # Skip last 5 values (to avoid NaN from forward calculations)
         initial_len_after_indicators = len(df)
@@ -904,19 +911,23 @@ def main():
         vxm_columns_rename = {col: f'VXM_{col}' for col in df_vxm.columns if col != 'Date'}
         df_vxm_renamed = df_vxm.rename(columns=vxm_columns_rename)
         
-        # Start with ES dataframe
-        df_combined = df.copy()
-        print(f"Starting with ES: {len(df_combined)} data points")
-        
-        # Merge VXM
-        print(f"Merging VXM: {len(df_vxm_renamed)} data points")
-        df_combined = pd.merge(df_combined, df_vxm_renamed, on='Date', how='outer')
+        # Start with ES dataframe — deduplicate so no source has multiple rows
+        # per timestamp (duplicate Date values cause cartesian-product row explosion
+        # in outer joins when the same timestamp appears in multiple sources).
+        df_combined = df.drop_duplicates(subset='Date', keep='last').copy()
+        print(f"Starting with ES: {len(df_combined)} data points  ({len(df)-len(df_combined)} duplicate-Date rows dropped)")
+
+        # Merge VXM — left join keeps only ES timestamps; deduplicate first
+        df_vxm_deduped = df_vxm_renamed.drop_duplicates(subset='Date', keep='last')
+        print(f"Merging VXM: {len(df_vxm_deduped)} data points  ({len(df_vxm_renamed)-len(df_vxm_deduped)} duplicate-Date rows dropped)")
+        df_combined = pd.merge(df_combined, df_vxm_deduped, on='Date', how='left')
         print(f"After VXM merge: {len(df_combined)} data points")
-        
-        # Merge all stocks
+
+        # Merge all stocks — left join on ES timestamps; deduplicate each source first
         for ticker, df_stock in stock_dataframes.items():
-            print(f"Merging {ticker}: {len(df_stock)} data points")
-            df_combined = pd.merge(df_combined, df_stock, on='Date', how='outer')
+            df_stock_deduped = df_stock.drop_duplicates(subset='Date', keep='last')
+            print(f"Merging {ticker}: {len(df_stock_deduped)} data points  ({len(df_stock)-len(df_stock_deduped)} duplicate-Date rows dropped)")
+            df_combined = pd.merge(df_combined, df_stock_deduped, on='Date', how='left')
             print(f"After {ticker} merge: {len(df_combined)} data points")
         
         # Sort by Date

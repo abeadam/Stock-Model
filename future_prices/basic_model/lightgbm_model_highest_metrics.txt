@@ -1,0 +1,29 @@
+LightGBM Model (highest) Metrics - PctChange_CloseToHigh
+============================================================
+
+TOP-N FEATURE SEARCH (candidate CV R²):
+------------------------------------------------------------
+Best TOP_N: 80 (CV R² = 0.2356)
+Selected features (best): 80
+  TOP_N=all -> CV R² = 0.2346
+  TOP_N= 20 -> CV R² = 0.2301
+  TOP_N= 30 -> CV R² = 0.2310
+  TOP_N= 40 -> CV R² = 0.2321
+  TOP_N= 60 -> CV R² = 0.2311
+  TOP_N= 80 -> CV R² = 0.2356
+
+10-FOLD CROSS-VALIDATION (mean ± std):
+------------------------------------------------------------
+MSE:   0.000142 ± 0.000079 (%²)
+RMSE:  0.011493 ± 0.003156%
+MAE:   0.006355 ± 0.001539%
+R²:    0.2306 ± 0.0229
+MAPE:  52.09 ± 9.89%
+
+FINAL MODEL ON FULL DATA (training fit):
+------------------------------------------------------------
+MSE: 0.000140 (%²)
+RMSE: 0.011819%
+MAE: 0.006321%
+R²: 0.2563
+MAPE: 51.68%
