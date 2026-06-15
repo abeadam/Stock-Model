@@ -250,6 +250,16 @@ def _build_all_feature_arrays(df: pd.DataFrame) -> dict[str, np.ndarray]:
              np.where(pct_signs < 0, prev_dn, 0.5))
         trend_str[f"TrendStrength_{w}"] = np.where(np.isnan(ts), 0.5, ts)
 
+    # ── Absolute Strength Index (bull/bear power; EMA of up/down % moves) ────
+    # Matches futures_price.calculate_absolute_strength: clip the % return into
+    # up/down components, then EMA each. Selected into both basic models.
+    up_move   = pct_s.clip(lower=0)
+    down_move = (-pct_s).clip(lower=0)
+    asi: dict[str, np.ndarray] = {}
+    for p in (7, 14, 28):
+        asi[f"ASI_Bull_{p}"] = up_move.ewm(span=p, adjust=False).mean().to_numpy(dtype=np.float64, na_value=np.nan)
+        asi[f"ASI_Bear_{p}"] = down_move.ewm(span=p, adjust=False).mean().to_numpy(dtype=np.float64, na_value=np.nan)
+
     # ── Core dict ───────────────────────────────────────────────────────────
     arrays: dict[str, np.ndarray] = {
         "Volume":           volume,
@@ -295,6 +305,7 @@ def _build_all_feature_arrays(df: pd.DataFrame) -> dict[str, np.ndarray]:
         **rolling,
         **price_pos,
         **trend_str,
+        **asi,
     }
 
     # ── VXM features (optional — NaN when VXM_Close absent) ────────────────
