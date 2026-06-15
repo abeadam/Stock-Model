@@ -218,6 +218,7 @@ def _build_all_feature_arrays(df: pd.DataFrame) -> dict[str, np.ndarray]:
     bb20_2_u, bb20_2_l = _bollinger(close, 20, 2.0)
     bb20_3_u, bb20_3_l = _bollinger(close, 20, 3.0)
     bb10_std = pd.Series(close).rolling(10).std().values
+    bb20_std = pd.Series(close).rolling(20).std().values
     bb50_std = pd.Series(close).rolling(50).std().values
 
     # ── Momentum ────────────────────────────────────────────────────────────
@@ -293,6 +294,7 @@ def _build_all_feature_arrays(df: pd.DataFrame) -> dict[str, np.ndarray]:
         "Momentum_10":      momentum_10,
         "PctChange_Lag_10": pct_lag_10,
         "BB_10_STD":        bb10_std,
+        "BB_20_STD":        bb20_std,
         "BB_50_STD":        bb50_std,
         "BB_20_1_Upper":    bb20_1_u,
         "BB_20_1_Lower":    bb20_1_l,
@@ -313,8 +315,10 @@ def _build_all_feature_arrays(df: pd.DataFrame) -> dict[str, np.ndarray]:
         "BB_20_2_Lower_vs_Low":   rel(bb20_2_l, low,   safe_low),
         "BB_20_2_Lower_vs_Close": rel(bb20_2_l, close, safe_close),
         "BB_20_3_Upper_vs_High":  rel(bb20_3_u, high,  safe_high),
+        "BB_20_3_Upper_vs_Low":   rel(bb20_3_u, low,   safe_low),
         "BB_20_3_Upper_vs_Close": rel(bb20_3_u, close, safe_close),
         "BB_20_3_Lower_vs_Low":   rel(bb20_3_l, low,   safe_low),
+        "BB_20_3_Lower_vs_High":  rel(bb20_3_l, high,  safe_high),
         "BB_20_3_Lower_vs_Close": rel(bb20_3_l, close, safe_close),
         "Volatility_10":    vol_10,
         "Volatility_20":    vol_20,
@@ -326,30 +330,92 @@ def _build_all_feature_arrays(df: pd.DataFrame) -> dict[str, np.ndarray]:
         **asi,
     }
 
-    # ── VXM features (optional — NaN when VXM_Close absent) ────────────────
+    # ── VXM features (volatility regime) ───────────────────────────────────
+    # Full set matching the offline pipeline: BB(10/20/50, 1/2/3 std) and EMA on
+    # VXM_Close (futures_price.calculate_bollinger_bands / calculate_ema), the
+    # BB_20_1-vs-OHLC distances and pct-change lags from prepare_features_and_target,
+    # plus the lowercase names the gradient model uses. VXM bars are the same
+    # 5-second IBKR stream as ES, so live values match training. Open/High/Low/
+    # Volume are used when supplied by the feed; absent fields stay NaN.
     vxm_col = next((c for c in ("VXM_Close", "VXM_CLOSE") if c in df.columns), None)
+    _VXM_KEYS = (
+        "VXM_Open", "VXM_High", "VXM_Low", "VXM_Close", "VXM_Volume",
+        "VXM_BB_10_STD", "VXM_BB_20_STD", "VXM_BB_50_STD",
+        "VXM_BB_20_1_Upper", "VXM_BB_20_1_Lower", "VXM_BB_20_2_Upper", "VXM_BB_20_2_Lower",
+        "VXM_BB_20_3_Upper", "VXM_BB_20_3_Lower", "VXM_BB_50_MA",
+        "VXM_BB_50_1_Upper", "VXM_BB_50_1_Lower", "VXM_BB_50_2_Upper", "VXM_BB_50_2_Lower",
+        "VXM_BB_50_3_Upper", "VXM_BB_50_3_Lower", "VXM_EMA_10", "VXM_EMA_20", "VXM_EMA_50",
+        "VXM_BB_20_1_Upper_vs_VXM_High", "VXM_BB_20_1_Upper_vs_VXM_Close", "VXM_BB_20_1_Upper_vs_VXM_Low",
+        "VXM_BB_20_1_Lower_vs_VXM_Low", "VXM_BB_20_1_Lower_vs_VXM_Close", "VXM_BB_20_1_Lower_vs_VXM_High",
+        "VXM_PctChange", "VXM_PctChange_Lag_1", "VXM_PctChange_Lag_2", "VXM_ES_Ratio",
+        "vxm_close", "vxm_pct", "vxm_pct_lag1", "vxm_pct_lag2", "vxm_es_ratio",
+    )
     if vxm_col is not None:
-        vxm_vals         = df[vxm_col].values.astype(np.float64)
-        safe_vxm         = np.where(vxm_vals > 0, vxm_vals, np.nan)
-        # Bar-to-bar % change and its lags (all NaN-safe, no lookahead)
-        vxm_pct          = np.concatenate([[np.nan], np.diff(vxm_vals) / safe_vxm[:-1] * 100.0])
-        vxm_pct_lag1     = np.concatenate([[np.nan], vxm_pct[:-1]])
-        vxm_pct_lag2     = np.concatenate([[np.nan, np.nan], vxm_pct[:-2]])
-        vxm_bb50_3_u, _  = _bollinger(vxm_vals, 50, 3.0)
-        vxm_es_ratio     = np.where(safe_close > 0, vxm_vals / close, np.nan)
-        arrays["VXM_BB_50_3_Upper"] = vxm_bb50_3_u
-        arrays["VXM_BB_50_STD"]     = pd.Series(vxm_vals).rolling(50).std().to_numpy(dtype=np.float64, na_value=np.nan)
-        arrays["VXM_ES_Ratio"]      = vxm_es_ratio
-        # Features matching prepare_data.py column names (used by gradient model)
-        arrays["vxm_close"]         = vxm_vals
-        arrays["vxm_pct"]           = vxm_pct
-        arrays["vxm_pct_lag1"]      = vxm_pct_lag1
-        arrays["vxm_pct_lag2"]      = vxm_pct_lag2
-        arrays["vxm_es_ratio"]      = vxm_es_ratio
+        vxm_close = df[vxm_col].values.astype(np.float64)
+        safe_vxm  = np.where(vxm_close > 0, vxm_close, np.nan)
+
+        def _vxm_field(field: str) -> np.ndarray:
+            col = next((c for c in (f"VXM_{field}", f"VXM_{field.upper()}") if c in df.columns), None)
+            return df[col].values.astype(np.float64) if col is not None else np.full(n, np.nan, dtype=np.float64)
+        vxm_high = _vxm_field("High")
+        vxm_low  = _vxm_field("Low")
+        safe_vxm_high = np.where(vxm_high > 0, vxm_high, np.nan)
+        safe_vxm_low  = np.where(vxm_low  > 0, vxm_low,  np.nan)
+
+        vxm_pct      = np.concatenate([[np.nan], np.diff(vxm_close) / safe_vxm[:-1] * 100.0])
+        vxm_pct_lag1 = np.concatenate([[np.nan], vxm_pct[:-1]])
+        vxm_pct_lag2 = np.concatenate([[np.nan, np.nan], vxm_pct[:-2]])
+        vxm_es_ratio = np.where(safe_close > 0, vxm_close / close, np.nan)
+
+        vbb20_1_u, vbb20_1_l = _bollinger(vxm_close, 20, 1.0)
+        vbb20_2_u, vbb20_2_l = _bollinger(vxm_close, 20, 2.0)
+        vbb20_3_u, vbb20_3_l = _bollinger(vxm_close, 20, 3.0)
+        vbb50_1_u, vbb50_1_l = _bollinger(vxm_close, 50, 1.0)
+        vbb50_2_u, vbb50_2_l = _bollinger(vxm_close, 50, 2.0)
+        vbb50_3_u, vbb50_3_l = _bollinger(vxm_close, 50, 3.0)
+
+        def _roll_std(values: np.ndarray, window: int) -> np.ndarray:
+            return pd.Series(values).rolling(window).std().to_numpy(dtype=np.float64, na_value=np.nan)
+
+        def _ema(values: np.ndarray, span: int) -> np.ndarray:
+            return pd.Series(values).ewm(span=span, adjust=False).mean().to_numpy(dtype=np.float64, na_value=np.nan)
+
+        arrays.update({
+            "VXM_Open":   _vxm_field("Open"),
+            "VXM_High":   vxm_high,
+            "VXM_Low":    vxm_low,
+            "VXM_Close":  vxm_close,
+            "VXM_Volume": _vxm_field("Volume"),
+            "VXM_BB_10_STD": _roll_std(vxm_close, 10),
+            "VXM_BB_20_STD": _roll_std(vxm_close, 20),
+            "VXM_BB_50_STD": _roll_std(vxm_close, 50),
+            "VXM_BB_20_1_Upper": vbb20_1_u, "VXM_BB_20_1_Lower": vbb20_1_l,
+            "VXM_BB_20_2_Upper": vbb20_2_u, "VXM_BB_20_2_Lower": vbb20_2_l,
+            "VXM_BB_20_3_Upper": vbb20_3_u, "VXM_BB_20_3_Lower": vbb20_3_l,
+            "VXM_BB_50_MA":    pd.Series(vxm_close).rolling(50).mean().to_numpy(dtype=np.float64, na_value=np.nan),
+            "VXM_BB_50_1_Upper": vbb50_1_u, "VXM_BB_50_1_Lower": vbb50_1_l,
+            "VXM_BB_50_2_Upper": vbb50_2_u, "VXM_BB_50_2_Lower": vbb50_2_l,
+            "VXM_BB_50_3_Upper": vbb50_3_u, "VXM_BB_50_3_Lower": vbb50_3_l,
+            "VXM_EMA_10": _ema(vxm_close, 10),
+            "VXM_EMA_20": _ema(vxm_close, 20),
+            "VXM_EMA_50": _ema(vxm_close, 50),
+            "VXM_BB_20_1_Upper_vs_VXM_High":  rel(vbb20_1_u, vxm_high,  safe_vxm_high),
+            "VXM_BB_20_1_Upper_vs_VXM_Close": rel(vbb20_1_u, vxm_close, safe_vxm),
+            "VXM_BB_20_1_Upper_vs_VXM_Low":   rel(vbb20_1_u, vxm_low,   safe_vxm_low),
+            "VXM_BB_20_1_Lower_vs_VXM_Low":   rel(vbb20_1_l, vxm_low,   safe_vxm_low),
+            "VXM_BB_20_1_Lower_vs_VXM_Close": rel(vbb20_1_l, vxm_close, safe_vxm),
+            "VXM_BB_20_1_Lower_vs_VXM_High":  rel(vbb20_1_l, vxm_high,  safe_vxm_high),
+            "VXM_PctChange": vxm_pct,
+            "VXM_PctChange_Lag_1": vxm_pct_lag1,
+            "VXM_PctChange_Lag_2": vxm_pct_lag2,
+            "VXM_ES_Ratio": vxm_es_ratio,
+            "vxm_close": vxm_close, "vxm_pct": vxm_pct,
+            "vxm_pct_lag1": vxm_pct_lag1, "vxm_pct_lag2": vxm_pct_lag2,
+            "vxm_es_ratio": vxm_es_ratio,
+        })
     else:
         nan_arr = np.full(n, np.nan, dtype=np.float64)
-        for key in ("VXM_BB_50_3_Upper", "VXM_BB_50_STD", "VXM_ES_Ratio",
-                    "vxm_close", "vxm_pct", "vxm_pct_lag1", "vxm_pct_lag2", "vxm_es_ratio"):
+        for key in _VXM_KEYS:
             arrays[key] = nan_arr.copy()
 
     # ── Time features (optional — NaN when no date column present) ──────────
