@@ -120,6 +120,24 @@ def _mfi(
     return np.where(np.isfinite(mfi), mfi, 100.0)
 
 
+def _parse_datetime_column(date_col: pd.Series) -> pd.Series:
+    """Parse a date column to datetimes without the dateutil per-element fallback.
+
+    Handles the three formats this code sees: numeric Unix seconds (offline ES
+    files), and string timestamps from either the IB feed ("YYYYMMDD HH:MM:SS",
+    sometimes double-spaced) or pandas/ISO ("YYYY-MM-DD HH:MM:SS"). Passing an
+    explicit format / "mixed" avoids pandas' "Could not infer format" warning,
+    which is both noisy and slow in the live per-bar loop.
+    """
+    if pd.api.types.is_numeric_dtype(date_col):
+        return pd.to_datetime(date_col, unit="s", errors="coerce")
+    cleaned = date_col.astype(str).str.strip().str.replace("  ", " ", regex=False)
+    parsed = pd.to_datetime(cleaned, format="%Y%m%d %H:%M:%S", errors="coerce")
+    if parsed.isna().all():  # not the IB compact format — fall back to general parsing
+        parsed = pd.to_datetime(cleaned, errors="coerce", format="mixed")
+    return parsed
+
+
 def _time_features(date_col: pd.Series, n: int) -> dict[str, np.ndarray]:
     """
     Compute time-of-day and calendar features from a date column.
@@ -127,7 +145,7 @@ def _time_features(date_col: pd.Series, n: int) -> dict[str, np.ndarray]:
     Falls back to NaN arrays on any parse error.
     """
     try:
-        dt        = pd.to_datetime(date_col, errors="coerce")
+        dt        = _parse_datetime_column(date_col)
         hour      = dt.dt.hour.values.astype(np.float64)
         minute    = dt.dt.minute.values.astype(np.float64)
         hour_frac = hour + minute / 60.0
