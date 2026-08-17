@@ -81,16 +81,20 @@ def _atr(high: np.ndarray, low: np.ndarray, close: np.ndarray, period: int) -> n
 
 
 def _rsi(close: np.ndarray, period: int) -> np.ndarray:
-    """RSI (EWM of gains/losses on close deltas)."""
+    """RSI (EWM of gains/losses on close deltas), matching futures_price.calculate_rsi.
+
+    Division is left to propagate the way pandas does it there: no losses in the
+    window gives rs=inf and RSI 100, while no movement at all gives 0/0 -> NaN,
+    which the caller's NaN filter drops instead of reading as a real RSI of 100.
+    """
     delta = np.diff(close.astype(np.float64), prepend=np.nan)
     gain = np.where(delta > 0, delta, 0.0)
     loss = np.where(delta < 0, -delta, 0.0)
     avg_gain = pd.Series(gain).ewm(span=period, adjust=False).mean().values
     avg_loss = pd.Series(loss).ewm(span=period, adjust=False).mean().values
     with np.errstate(divide="ignore", invalid="ignore"):
-        rs = np.where(avg_loss != 0, avg_gain / avg_loss, np.inf)
-    rsi = 100.0 - (100.0 / (1.0 + rs))
-    return np.where(np.isfinite(rsi), rsi, 100.0)
+        rs = avg_gain / avg_loss
+        return 100.0 - (100.0 / (1.0 + rs))
 
 
 def _bollinger(close: np.ndarray, period: int, num_std: float) -> tuple[np.ndarray, np.ndarray]:
@@ -100,6 +104,21 @@ def _bollinger(close: np.ndarray, period: int, num_std: float) -> tuple[np.ndarr
     return ma + num_std * std, ma - num_std * std
 
 
+def _roll_mean(values: np.ndarray, period: int) -> np.ndarray:
+    """Rolling mean (the BB_{period}_MA of futures_price.calculate_bollinger_bands)."""
+    return pd.Series(values).rolling(period).mean().to_numpy(dtype=np.float64, na_value=np.nan)
+
+
+def _roll_std(values: np.ndarray, period: int) -> np.ndarray:
+    """Rolling standard deviation."""
+    return pd.Series(values).rolling(period).std().to_numpy(dtype=np.float64, na_value=np.nan)
+
+
+def _ema(values: np.ndarray, span: int) -> np.ndarray:
+    """EMA with adjust=False, matching futures_price.calculate_ema."""
+    return pd.Series(values).ewm(span=span, adjust=False).mean().to_numpy(dtype=np.float64, na_value=np.nan)
+
+
 def _mfi(
     high: np.ndarray,
     low: np.ndarray,
@@ -107,7 +126,13 @@ def _mfi(
     volume: np.ndarray,
     period: int,
 ) -> np.ndarray:
-    """Money Flow Index."""
+    """Money Flow Index, matching futures_price.calculate_mfi.
+
+    A zero negative-flow sum means every flow in the window was positive, which
+    is MFI 100. Rows in the rolling warmup keep NaN rather than collapsing to
+    100, so they match the training data and get dropped by the caller's
+    NaN filter instead of entering the model as a real-looking value.
+    """
     typical_price = (high + low + close) / 3.0
     money_flow    = typical_price * volume
     tp_delta      = np.diff(typical_price, prepend=np.nan)
@@ -115,9 +140,9 @@ def _mfi(
     neg_flow      = np.where(tp_delta < 0, money_flow, 0.0)
     pos_sum       = pd.Series(pos_flow).rolling(period).sum().values
     neg_sum       = pd.Series(neg_flow).rolling(period).sum().values
-    safe_neg      = np.where(neg_sum > 0, neg_sum, np.nan)
-    mfi           = 100.0 - (100.0 / (1.0 + pos_sum / safe_neg))
-    return np.where(np.isfinite(mfi), mfi, 100.0)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        ratio = pos_sum / neg_sum
+    return np.where(neg_sum == 0, 100.0, 100.0 - (100.0 / (1.0 + ratio)))
 
 
 def _parse_datetime_column(date_col: pd.Series) -> pd.Series:
@@ -210,6 +235,7 @@ def _build_all_feature_arrays(df: pd.DataFrame) -> dict[str, np.ndarray]:
     rsi_7  = _rsi(close,  7)
     rsi_14 = _rsi(close, 14)
     rsi_28 = _rsi(close, 28)
+    mfi_7  = _mfi(high, low, close, volume,  7)
     mfi_14 = _mfi(high, low, close, volume, 14)
     mfi_28 = _mfi(high, low, close, volume, 28)
 
@@ -217,9 +243,13 @@ def _build_all_feature_arrays(df: pd.DataFrame) -> dict[str, np.ndarray]:
     bb20_1_u, bb20_1_l = _bollinger(close, 20, 1.0)
     bb20_2_u, bb20_2_l = _bollinger(close, 20, 2.0)
     bb20_3_u, bb20_3_l = _bollinger(close, 20, 3.0)
-    bb10_std = pd.Series(close).rolling(10).std().values
-    bb20_std = pd.Series(close).rolling(20).std().values
-    bb50_std = pd.Series(close).rolling(50).std().values
+    bb50_1_u, bb50_1_l = _bollinger(close, 50, 1.0)
+    bb50_2_u, bb50_2_l = _bollinger(close, 50, 2.0)
+    bb50_3_u, bb50_3_l = _bollinger(close, 50, 3.0)
+    bb10_std = _roll_std(close, 10)
+    bb20_std = _roll_std(close, 20)
+    bb50_std = _roll_std(close, 50)
+    bb50_ma  = _roll_mean(close, 50)
 
     # ── Momentum ────────────────────────────────────────────────────────────
     momentum_5  = np.full(n, np.nan, dtype=np.float64)
@@ -227,9 +257,13 @@ def _build_all_feature_arrays(df: pd.DataFrame) -> dict[str, np.ndarray]:
     if n >= 6:  momentum_5[5:]   = pct[5:]   - pct[: n - 5]
     if n >= 11: momentum_10[10:] = pct[10:]  - pct[: n - 10]
 
-    # ── Pct-change lag ──────────────────────────────────────────────────────
-    pct_lag_10 = np.full(n, np.nan, dtype=np.float64)
-    if n > 10: pct_lag_10[10:] = pct[: n - 10]
+    # ── Pct-change lags ─────────────────────────────────────────────────────
+    # Matches lightgbm_utils.prepare_features_and_target, which lags
+    # Close.pct_change()*100 by each of these offsets.
+    pct_lags: dict[str, np.ndarray] = {
+        f"PctChange_Lag_{lag}": pct_s.shift(lag).to_numpy(dtype=np.float64, na_value=np.nan)
+        for lag in (1, 2, 3, 5, 10, 20)
+    }
 
     # ── Rolling stats on pct (windows 5 / 10 / 20 / 50) ───────────────────
     rolling: dict[str, np.ndarray] = {}
@@ -287,15 +321,26 @@ def _build_all_feature_arrays(df: pd.DataFrame) -> dict[str, np.ndarray]:
         "RSI_7":            rsi_7,
         "RSI_14":           rsi_14,
         "RSI_28":           rsi_28,
+        "MFI_7":            mfi_7,
         "MFI_14":           mfi_14,
         "MFI_28":           mfi_28,
         "RSI_7_x_Volume":   rsi_7 * volume,
         "Momentum_5":       momentum_5,
         "Momentum_10":      momentum_10,
-        "PctChange_Lag_10": pct_lag_10,
+        **pct_lags,
+        "EMA_10":           _ema(close, 10),
+        "EMA_20":           _ema(close, 20),
+        "EMA_50":           _ema(close, 50),
         "BB_10_STD":        bb10_std,
         "BB_20_STD":        bb20_std,
         "BB_50_STD":        bb50_std,
+        "BB_50_MA":         bb50_ma,
+        "BB_50_1_Upper":    bb50_1_u,
+        "BB_50_1_Lower":    bb50_1_l,
+        "BB_50_2_Upper":    bb50_2_u,
+        "BB_50_2_Lower":    bb50_2_l,
+        "BB_50_3_Upper":    bb50_3_u,
+        "BB_50_3_Lower":    bb50_3_l,
         "BB_20_1_Upper":    bb20_1_u,
         "BB_20_1_Lower":    bb20_1_l,
         "BB_20_2_Upper":    bb20_2_u,
@@ -374,12 +419,6 @@ def _build_all_feature_arrays(df: pd.DataFrame) -> dict[str, np.ndarray]:
         vbb50_2_u, vbb50_2_l = _bollinger(vxm_close, 50, 2.0)
         vbb50_3_u, vbb50_3_l = _bollinger(vxm_close, 50, 3.0)
 
-        def _roll_std(values: np.ndarray, window: int) -> np.ndarray:
-            return pd.Series(values).rolling(window).std().to_numpy(dtype=np.float64, na_value=np.nan)
-
-        def _ema(values: np.ndarray, span: int) -> np.ndarray:
-            return pd.Series(values).ewm(span=span, adjust=False).mean().to_numpy(dtype=np.float64, na_value=np.nan)
-
         arrays.update({
             "VXM_Open":   _vxm_field("Open"),
             "VXM_High":   vxm_high,
@@ -392,7 +431,7 @@ def _build_all_feature_arrays(df: pd.DataFrame) -> dict[str, np.ndarray]:
             "VXM_BB_20_1_Upper": vbb20_1_u, "VXM_BB_20_1_Lower": vbb20_1_l,
             "VXM_BB_20_2_Upper": vbb20_2_u, "VXM_BB_20_2_Lower": vbb20_2_l,
             "VXM_BB_20_3_Upper": vbb20_3_u, "VXM_BB_20_3_Lower": vbb20_3_l,
-            "VXM_BB_50_MA":    pd.Series(vxm_close).rolling(50).mean().to_numpy(dtype=np.float64, na_value=np.nan),
+            "VXM_BB_50_MA":    _roll_mean(vxm_close, 50),
             "VXM_BB_50_1_Upper": vbb50_1_u, "VXM_BB_50_1_Lower": vbb50_1_l,
             "VXM_BB_50_2_Upper": vbb50_2_u, "VXM_BB_50_2_Lower": vbb50_2_l,
             "VXM_BB_50_3_Upper": vbb50_3_u, "VXM_BB_50_3_Lower": vbb50_3_l,

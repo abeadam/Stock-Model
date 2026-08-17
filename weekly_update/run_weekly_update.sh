@@ -10,12 +10,15 @@
 #      lightgbm_model_lowest.py   ]
 #   4. gradient_value/prepare_data.py
 #   5. gradient_value/train_predictor.py
-#   6. model_tester.py            (RL agent P&L report)
-#   6b. gradient_value/optimize_thresholds.py  (produces the buy/sell grid)
-#   7. propose_thresholds.py      (writes a RECOMMENDATION — does not edit the trader)
+#   6. gradient_value/optimize_thresholds.py  (produces the buy/sell grid)
+#   7. propose_thresholds.py      (applies the thresholds to futures_trader.py
+#                                   if they pass sanity checks; otherwise
+#                                   refuses and leaves the file untouched)
 #
 # Failure policy: stop on first failure, log everything, exit non-zero.
-# This script NEVER edits futures_trader.py and NEVER places an order.
+# This script NEVER restarts the running trader and NEVER places an order —
+# step 7 may update the two threshold constants in futures_trader.py, but the
+# running process only picks them up on its next restart, which stays manual.
 #
 set -uo pipefail
 
@@ -97,6 +100,16 @@ trap cleanup EXIT INT TERM
 # Some scripts in this pipeline swallow exceptions and still exit 0
 # (model_tester.py's main() catches Exception and prints a traceback).
 # A clean exit code alone is therefore not proof of success.
+#
+# The IBKR download scripts' error() callbacks print every TWS notification as
+# "Error: reqId, code, message" -- including routine, non-fatal ones: 2103/2105
+# ("farm connection is broken", self-heals), 2104/2106/2108/2158 ("farm
+# connection is OK" / "available upon demand"), and 162 with "HMDS query
+# returned no data" (a single symbol-day genuinely has no data, e.g. a futures
+# contract rollover gap -- the script already records this and moves on).
+# None of those indicate the run failed, so they're excluded before checking
+# for a real error.
+BENIGN_IBKR_ERROR_PATTERN='(Market data farm connection|HMDS data farm connection|Sec-def data farm connection|HMDS query returned no data)'
 scan_for_swallowed_errors() {
     local step_log="$1"
     if grep -qE '^Traceback \(most recent call last\):' "$step_log"; then
@@ -104,9 +117,9 @@ scan_for_swallowed_errors() {
         grep -nE '^[A-Za-z_.]*(Error|Exception):' "$step_log" | tail -5 | tee -a "$LOG"
         return 1
     fi
-    if grep -qE '^Error: ' "$step_log"; then
+    if grep -E '^Error: ' "$step_log" | grep -qvE "$BENIGN_IBKR_ERROR_PATTERN"; then
         log "  !! Script reported an error despite exit code 0"
-        grep -nE '^Error: ' "$step_log" | tail -5 | tee -a "$LOG"
+        grep -E '^Error: ' "$step_log" | grep -vE "$BENIGN_IBKR_ERROR_PATTERN" | tail -5 | tee -a "$LOG"
         return 1
     fi
     return 0
@@ -211,16 +224,23 @@ scan_for_swallowed_errors "$LOW_LOG"  || STEP3_FAIL="${STEP3_FAIL:+$STEP3_FAIL; 
 [ -z "$STEP3_FAIL" ] || die "step 3 failed: $STEP3_FAIL"
 log "STEP 3 — OK (both models trained)"
 
+# --- step 3b: the retrained models must be usable by the live trader -----------
+# Step 3 rewrites each model's feature-importance CSV, and that CSV is the
+# contract es_features.py reads at prediction time. If a retrain selects a
+# feature the live generator cannot compute, futures_trader.py keeps predicting
+# with that column silently NaN-filled. Catch it here, while the cause is
+# obvious, instead of discovering it weeks later in live behaviour.
+run_step "3b_verify_live_features" "$HERE" "$IBKR_PY" "$HERE/verify_live_features.py" \
+    --basic-model-dir "$BASIC_DIR"
+
 run_step "4_prepare_data"       "$GRAD_DIR" "$IBKR_PY" "$GRAD_DIR/prepare_data.py"
 run_step "5_train_predictor"    "$GRAD_DIR" "$IBKR_PY" "$GRAD_DIR/train_predictor.py"
-run_step "6_model_tester"       "$FP_DIR"   "$IBKR_PY" "$FP_DIR/model_tester.py"
-run_step "6b_optimize_thresholds" "$GRAD_DIR" "$IBKR_PY" "$GRAD_DIR/optimize_thresholds.py"
+run_step "6_optimize_thresholds" "$GRAD_DIR" "$IBKR_PY" "$GRAD_DIR/optimize_thresholds.py"
 
-# --- step 7: recommend thresholds (review-only, no edit) -----------------------
+# --- step 7: apply thresholds if they pass sanity checks -----------------------
 run_step "7_propose_thresholds" "$HERE" "$MODEL_PY" "$HERE/propose_thresholds.py" \
     --results     "$GRAD_DIR/threshold_optimization.txt" \
     --trader      "$TRADER_PY" \
-    --tester-log  "$LOG_DIR/run_${RUN_ID}__6_model_tester.log" \
     --report-dir  "$REPORT_DIR" \
     --backup-dir  "$BACKUP_DIR" \
     --min-mtime   "$RUN_START_EPOCH" \
@@ -228,9 +248,10 @@ run_step "7_propose_thresholds" "$HERE" "$MODEL_PY" "$HERE/propose_thresholds.py
 
 log "============================================================="
 log "RUN COMPLETE"
-log "Recommendation: $REPORT_DIR/latest_recommendation.md"
-log "Full log:       $LOG"
-log "futures_trader.py was NOT modified — apply the thresholds yourself."
+log "Report:   $REPORT_DIR/latest_recommendation.md"
+log "Full log: $LOG"
+log "See the report above for whether futures_trader.py was updated."
+log "Restart the trader for any threshold change to take effect — this script never does."
 log "============================================================="
 cleanup
 exit 0

@@ -1,8 +1,9 @@
 # Weekly Stock-Model update
 
-Runs the full model refresh every **Monday at 08:00** and produces a threshold
-recommendation for `futures_trader.py`. It does not edit the trader and does not
-place orders.
+Runs the full model refresh every **Monday at 08:00** and applies the new
+buy/sell probability thresholds to `futures_trader.py`, if they pass sanity
+checks. It never restarts the running trader — that stays a manual step — and
+it never places orders.
 
 ## Install
 
@@ -40,18 +41,49 @@ launchctl bootout gui/$(id -u)/com.abeadam.stockmodel.weekly
 | 1 | `download_daily.py` — pulls each symbol-day into `daily_data/`, skipping days already on disk | ibkr venv |
 | 2 | `future_prices/futures_price.py` | Stock-Model venv |
 | 3 | `basic_model/lightgbm_model_highest.py` + `lightgbm_model_lowest.py`, concurrently | ibkr venv |
+| 3b | `verify_live_features.py` — every feature the new models selected must be computable live | ibkr venv |
 | 4 | `gradient_value/prepare_data.py` | ibkr venv |
 | 5 | `gradient_value/train_predictor.py` | ibkr venv |
-| 6 | `future_prices/model_tester.py` | ibkr venv |
-| 6b | `gradient_value/optimize_thresholds.py` | ibkr venv |
-| 7 | `propose_thresholds.py` — writes the recommendation | Stock-Model venv |
+| 6 | `gradient_value/optimize_thresholds.py` | ibkr venv |
+| 7 | `propose_thresholds.py` — applies the new thresholds if sane | Stock-Model venv |
 
-**Why 6b exists.** `model_tester.py` backtests the RL agent and prints portfolio
-P&L — it never emits gradient probability thresholds. The values in
-`futures_trader.py` come from `optimize_thresholds.py`, which grids buy/sell on a
-validation split and writes `Chosen: policy=... buy=... sell=...` to
-`gradient_value/threshold_optimization.txt`. Step 7 parses that line. Step 6 is
-kept for its RL P&L report, which is included in the weekly recommendation.
+**What step 6 produces.** `optimize_thresholds.py` grids buy/sell probability
+thresholds on a validation split and writes
+`Chosen: policy=... buy=... sell=...` to
+`gradient_value/threshold_optimization.txt`. Step 7 parses that line, sanity-checks
+it, backs up `futures_trader.py`, and — if the checks pass — rewrites the two
+threshold constants in place.
+
+(There used to be a step 6 running `future_prices/model_tester.py` for an RL
+agent P&L report, with `optimize_thresholds.py` as "6b". That RL agent's
+checkpoint doesn't currently exist, so model_tester.py was dropped from the
+pipeline and optimize_thresholds.py was promoted to step 6.)
+
+## Why step 3b exists
+
+`futures_trader.py` predicts through `basic_model/es_features.py`, which returns one
+column per row of `lightgbm_model_<kind>_feature_importances_splits_and_gain.csv` —
+and step 3 rewrites that CSV on every retrain. Nothing in the model training
+knows or cares what the live generator can compute, so a retrain is free to
+select a feature `es_features.py` has no computation for. When that happens
+`compute_es_features()` fills the column with NaN, prints a warning, and LightGBM
+routes it through its missing-value branch: the trader keeps running, on degraded
+input, and no step fails. Backtest metrics still look fine, because training used
+the real values from the offline dataset.
+
+That is not hypothetical. It was live: the `highest` model had selected 16 features
+(`BB_50_*`, `EMA_10/20/50`, `MFI_7`, `PctChange_Lag_1/2/3/5/20`) that
+`es_features.py` never implemented. Step 3b fails the run instead, listing the
+offending names.
+
+Two distinct failure modes are checked, because they need different fixes:
+
+- **Not implemented** — port the calculation into `es_features.py`, matching the
+  formula in `futures_price.py` / `lightgbm_utils.py` exactly.
+- **No live data source** — the name is implemented but can only ever be NaN on a
+  live bar window. The training set carries ~440 per-stock columns (`TSLA_*`,
+  `NVDA_*`, ...) that the live ES+VXM feed has no source for. If a retrain selects
+  one, the fix is to exclude it from training, not to write more feature code.
 
 ## Output
 
@@ -62,17 +94,22 @@ weekly_update/
 └── backups/    futures_trader_<timestamp>.py  (copy taken every run)
 ```
 
-Read `reports/latest_recommendation.md` each Monday. If it proposes a change,
-edit the two constants in `futures_trader.py` yourself and **restart the trader** —
-it reads them at startup.
+Read `reports/latest_recommendation.md` each Monday to see whether
+`futures_trader.py` was updated (and why, if it wasn't). If it was updated,
+**restart the trader** — it only reads the thresholds at startup, and this
+pipeline never restarts it for you.
 
 ## Failure behaviour
 
 - Stops at the first failing step; nothing downstream runs on bad data.
 - A clean exit code isn't trusted on its own: step logs are also scanned for
-  `Traceback` and `Error:`, because `model_tester.py` catches exceptions and still
-  exits 0. A script that legitimately prints those strings will trip this — check
-  the step log before assuming a real failure.
+  `Traceback` and `Error:`. The IBKR download scripts print every TWS
+  notification as `Error: reqId, code, message`, including routine ones
+  (farm connection status, a single symbol-day with no data) — those specific,
+  known-benign patterns are excluded from the check (see
+  `BENIGN_IBKR_ERROR_PATTERN` in `run_weekly_update.sh`) so they don't fail an
+  otherwise-successful step. Any other `Error:`/`Traceback` line still fails
+  the run — check the step log before assuming a real failure.
 - Per-step timeout of 4h (`STEP_TIMEOUT` env var to change).
 - `download_daily.py` has no interactive prompts — it runs unattended and gets
   `/dev/null` on stdin like every other step, so an unexpected prompt anywhere
@@ -95,9 +132,11 @@ which is why `download_daily.py` defaults to the last 180 days: that's roughly
 the practical ceiling of what's recoverable at this granularity, not an
 arbitrary choice.
 - A lock directory prevents two runs overlapping.
-- Step 7 refuses to recommend from a `threshold_optimization.txt` older than the
-  current run, and exits 3 if the proposed pair fails sanity checks
-  (buy outside 0.50–0.95, sell outside 0.05–0.50, or buy ≤ sell).
+- Step 7 refuses to apply from a `threshold_optimization.txt` older than the
+  current run, and refuses to touch `futures_trader.py` (exit 3) if the
+  proposed pair fails sanity checks (buy outside 0.50–0.95, sell outside
+  0.05–0.50, or buy ≤ sell) — `futures_trader.py` is backed up every run
+  regardless of whether it ends up changed.
 
 ## Requirements on Monday morning
 

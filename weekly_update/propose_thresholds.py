@@ -1,22 +1,26 @@
 #!/usr/bin/env python3
 """
-Step 7 of the weekly Stock-Model refresh: recommend GRADIENT_BUY_THRESHOLD and
-GRADIENT_SELL_THRESHOLD for futures_trader.py.
+Step 7 of the weekly Stock-Model refresh: apply GRADIENT_BUY_THRESHOLD and
+GRADIENT_SELL_THRESHOLD to futures_trader.py.
 
-This script is deliberately read-only with respect to the trading code. It:
+This script:
   - parses gradient_value/threshold_optimization.txt (written by
     optimize_thresholds.py) for the validation-selected buy/sell pair,
   - reads the values currently hardcoded in futures_trader.py,
   - sanity-checks the proposal,
   - backs up futures_trader.py,
-  - writes a markdown recommendation for a human to apply.
+  - if the proposal passes sanity checks, writes the new values directly into
+    futures_trader.py (if it fails, the file is left untouched),
+  - writes a markdown report describing what was (or was not) changed.
 
-It never edits futures_trader.py, never connects to TWS, and never places an order.
+It never restarts the running trader process — restart it yourself for a
+threshold change to take effect. It never connects to TWS and never places an
+order.
 
 Exit codes:
-    0  recommendation written, values look sane
+    0  applied (or no change was needed) — see the report for which
     2  could not parse / results file is stale (nothing written)
-    3  recommendation written but FAILED sanity checks — do not apply blindly
+    3  proposal FAILED sanity checks — futures_trader.py was NOT modified
 """
 
 from __future__ import annotations
@@ -49,15 +53,39 @@ CURRENT_SELL_RE = re.compile(
     r"^\s*GRADIENT_SELL_THRESHOLD\s*=\s*(?P<value>-?[0-9.]+)", re.MULTILINE
 )
 
+# Same two constants, but capturing the prefix (indent/name/spacing) and
+# trailing comment so a rewrite can swap only the number and leave everything
+# else — comments included — exactly as it was.
+BUY_LINE_RE = re.compile(
+    r"^(?P<prefix>\s*GRADIENT_BUY_THRESHOLD\s*=\s*)(?P<value>-?[0-9.]+)(?P<suffix>.*)$",
+    re.MULTILINE,
+)
+SELL_LINE_RE = re.compile(
+    r"^(?P<prefix>\s*GRADIENT_SELL_THRESHOLD\s*=\s*)(?P<value>-?[0-9.]+)(?P<suffix>.*)$",
+    re.MULTILINE,
+)
+
+
+def apply_thresholds(trader: Path, buy: float, sell: float) -> None:
+    """Rewrite the two threshold constants in futures_trader.py in place."""
+    text = trader.read_text()
+    text, n_buy = BUY_LINE_RE.subn(lambda m: f"{m['prefix']}{buy:.2f}{m['suffix']}", text, count=1)
+    text, n_sell = SELL_LINE_RE.subn(lambda m: f"{m['prefix']}{sell:.2f}{m['suffix']}", text, count=1)
+    if n_buy != 1 or n_sell != 1:
+        fail(
+            f"expected exactly one GRADIENT_BUY_THRESHOLD and one "
+            f"GRADIENT_SELL_THRESHOLD line to update, found buy={n_buy} sell={n_sell} "
+            f"— refusing to write a partial or ambiguous edit"
+        )
+    trader.write_text(text)
+
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--results", type=Path, required=True,
                    help="threshold_optimization.txt produced by optimize_thresholds.py")
     p.add_argument("--trader", type=Path, required=True,
-                   help="futures_trader.py (read + backed up, never written)")
-    p.add_argument("--tester-log", type=Path, default=None,
-                   help="model_tester.py step log, for the RL P&L summary")
+                   help="futures_trader.py (read, backed up, and updated if sane)")
     p.add_argument("--report-dir", type=Path, required=True)
     p.add_argument("--backup-dir", type=Path, required=True)
     p.add_argument("--min-mtime", type=float, default=0.0,
@@ -128,8 +156,8 @@ def parse_results(path: Path, min_mtime: float) -> dict:
     }
 
 
-def parse_current_thresholds(trader: Path) -> tuple[float | None, float | None, int | None, int | None]:
-    """Read the thresholds hardcoded in futures_trader.py, with line numbers."""
+def parse_current_thresholds(trader: Path) -> tuple[float | None, float | None]:
+    """Read the thresholds currently hardcoded in futures_trader.py."""
     if not trader.exists():
         fail(f"futures_trader.py not found: {trader}")
     text = trader.read_text()
@@ -137,9 +165,7 @@ def parse_current_thresholds(trader: Path) -> tuple[float | None, float | None, 
     buy_m, sell_m = CURRENT_BUY_RE.search(text), CURRENT_SELL_RE.search(text)
     buy = float(buy_m["value"]) if buy_m else None
     sell = float(sell_m["value"]) if sell_m else None
-    buy_line = text[: buy_m.start()].count("\n") + 1 if buy_m else None
-    sell_line = text[: sell_m.start()].count("\n") + 1 if sell_m else None
-    return buy, sell, buy_line, sell_line
+    return buy, sell
 
 
 def sanity_check(buy: float, sell: float,
@@ -159,19 +185,8 @@ def sanity_check(buy: float, sell: float,
     return problems
 
 
-def extract_tester_summary(log_path: Path | None) -> list[str]:
-    """Pull the closing summary lines out of the model_tester.py step log."""
-    if not log_path or not log_path.exists():
-        return []
-    lines = log_path.read_text().splitlines()
-    keep = [ln for ln in lines
-            if ln.startswith(("Total days tested:", "Starting capital",
-                              "Final portfolio value:", "Total return:"))]
-    return keep[-6:]
-
-
-def build_report(res: dict, cur_buy, cur_sell, buy_line, sell_line,
-                 problems: list[str], tester_lines: list[str],
+def build_report(res: dict, cur_buy, cur_sell,
+                 problems: list[str], applied: bool,
                  backup_path: Path, results_path: Path, trader: Path) -> str:
     buy, sell = res["buy"], res["sell"]
     changed = (cur_buy != buy) or (cur_sell != sell)
@@ -179,29 +194,31 @@ def build_report(res: dict, cur_buy, cur_sell, buy_line, sell_line,
                (cur_sell is not None and abs(sell - cur_sell) >= LARGE_MOVE)
 
     out = [
-        f"# Threshold recommendation — {datetime.now():%A %d %B %Y, %H:%M}",
-        "",
-        "**Nothing has been changed.** `futures_trader.py` is untouched; this is a",
-        "proposal for you to review and apply by hand.",
-        "",
-        "## Verdict",
+        f"# Threshold update — {datetime.now():%A %d %B %Y, %H:%M}",
         "",
     ]
+    if applied:
+        out += [f"**`futures_trader.py` was updated.** Backup: `{backup_path}`.",
+                "Restart the trader for the change to take effect — this script never does.", ""]
+    else:
+        out += ["**`futures_trader.py` was NOT modified.**", ""]
+
+    out += ["## Verdict", ""]
 
     if problems:
-        out += ["> **DO NOT APPLY WITHOUT CHECKING.** Sanity checks failed:", ""]
+        out += ["> **NOT APPLIED — sanity checks failed:**", ""]
         out += [f"> - {p}" for p in problems] + [""]
     elif not changed:
         out += ["No change needed — the optimizer picked the values already in the trader.", ""]
     elif big_move:
-        out += [f"Change proposed, and it is a large move (>= {LARGE_MOVE:.2f}). Worth a second look.", ""]
+        out += [f"Applied. This was a large move (>= {LARGE_MOVE:.2f}) — worth a second look.", ""]
     else:
-        out += ["Change proposed and within normal range.", ""]
+        out += ["Applied, and within normal range.", ""]
 
     out += [
         "## Values",
         "",
-        "| Constant | Current | Proposed | Delta |",
+        "| Constant | Previous | New | Delta |",
         "|---|---|---|---|",
         f"| `GRADIENT_BUY_THRESHOLD` | {fmt(cur_buy)} | **{buy:.2f}** | {delta(cur_buy, buy)} |",
         f"| `GRADIENT_SELL_THRESHOLD` | {fmt(cur_sell)} | **{sell:.2f}** | {delta(cur_sell, sell)} |",
@@ -209,24 +226,6 @@ def build_report(res: dict, cur_buy, cur_sell, buy_line, sell_line,
         f"Policy selected by the optimizer: `{res['policy']}`",
         "",
     ]
-
-    if changed and not problems:
-        out += [
-            "## To apply",
-            "",
-            f"Edit `{trader}`"
-            + (f" (lines {buy_line} and {sell_line})" if buy_line and sell_line else "")
-            + ":",
-            "",
-            "```python",
-            f"GRADIENT_BUY_THRESHOLD  =  {buy:.2f}  # BUY  when prob(up) > this",
-            f"GRADIENT_SELL_THRESHOLD =  {sell:.2f}  # SELL when prob(up) < this",
-            "```",
-            "",
-            "The running trader loads these at startup — restart it for the change to take effect.",
-            f"Backup of the current file: `{backup_path}`",
-            "",
-        ]
 
     if res["ranked"]:
         out += [
@@ -242,9 +241,6 @@ def build_report(res: dict, cur_buy, cur_sell, buy_line, sell_line,
     if res["metrics"]:
         out += ["## Held-out test half (chosen thresholds)", ""]
         out += [f"- **{k}**: {v}" for k, v in res["metrics"].items()] + [""]
-
-    if tester_lines:
-        out += ["## RL agent check (model_tester.py)", "", "```"] + tester_lines + ["```", ""]
 
     out += [
         "## Provenance",
@@ -276,14 +272,19 @@ def main() -> None:
     args.backup_dir.mkdir(parents=True, exist_ok=True)
 
     res = parse_results(args.results, args.min_mtime)
-    cur_buy, cur_sell, buy_line, sell_line = parse_current_thresholds(args.trader)
+    cur_buy, cur_sell = parse_current_thresholds(args.trader)
     problems = sanity_check(res["buy"], res["sell"], cur_buy, cur_sell)
+    changed = (cur_buy != res["buy"]) or (cur_sell != res["sell"])
 
     backup_path = args.backup_dir / f"futures_trader_{args.run_id}.py"
     shutil.copy2(args.trader, backup_path)
 
-    report = build_report(res, cur_buy, cur_sell, buy_line, sell_line, problems,
-                          extract_tester_summary(args.tester_log),
+    applied = False
+    if not problems and changed:
+        apply_thresholds(args.trader, res["buy"], res["sell"])
+        applied = True
+
+    report = build_report(res, cur_buy, cur_sell, problems, applied,
                           backup_path, args.results, args.trader)
 
     dated = args.report_dir / f"thresholds_{args.run_id}.md"
@@ -296,23 +297,27 @@ def main() -> None:
         "generated": datetime.now().isoformat(timespec="seconds"),
         "policy": res["policy"],
         "proposed": {"buy": res["buy"], "sell": res["sell"]},
-        "current": {"buy": cur_buy, "sell": cur_sell},
-        "changed": (cur_buy != res["buy"]) or (cur_sell != res["sell"]),
+        "previous": {"buy": cur_buy, "sell": cur_sell},
+        "changed": changed,
         "problems": problems,
-        "applied": False,
+        "applied": applied,
         "backup": str(backup_path),
     }, indent=2))
 
-    print(f"Proposed: buy={res['buy']:.2f} sell={res['sell']:.2f} "
-          f"(current: buy={fmt(cur_buy)} sell={fmt(cur_sell)}, policy={res['policy']})")
+    print(f"{'Applied' if applied else 'Proposed'}: buy={res['buy']:.2f} sell={res['sell']:.2f} "
+          f"(previous: buy={fmt(cur_buy)} sell={fmt(cur_sell)}, policy={res['policy']})")
     print(f"Report:   {latest}")
     print(f"Backup:   {backup_path}")
-    print("futures_trader.py was NOT modified.")
 
     if problems:
         for problem in problems:
             print(f"SANITY CHECK FAILED: {problem}")
+        print("futures_trader.py was NOT modified — fix the underlying issue and rerun.")
         sys.exit(3)
+    elif applied:
+        print("futures_trader.py UPDATED. Restart the trader for the change to take effect.")
+    else:
+        print("No change needed — futures_trader.py already matches the optimizer's choice.")
 
 
 if __name__ == "__main__":
