@@ -9,11 +9,14 @@ The position chosen at bar t is held into bar t+1, so the signal never uses
 information from the bar whose return it earns. Evaluated on the same held-out
 last-20% test split used by train_predictor.py.
 
+Thresholds default to the constants below; override them with --buy/--sell/--policy.
+
 Outputs: backtest_results.txt and backtest_equity_curve.png.
 """
 
 from __future__ import annotations
 
+import argparse
 from pathlib import Path
 
 import joblib
@@ -30,9 +33,13 @@ MODEL_PKL = _HERE / "predictor_model.pkl"
 RESULTS_TXT = _HERE / "backtest_results.txt"
 EQUITY_PNG = _HERE / "backtest_equity_curve.png"
 
-# Strategy / market parameters. Defaults are the validation-selected configuration
-# from optimize_thresholds.py: a "hold until opposite" policy trades far less and is
-# the only kind that survives realistic slippage (see threshold_optimization.txt).
+# Strategy / market parameters. The thresholds here are only defaults for a
+# standalone run -- pass --buy/--sell/--policy to override. They do NOT track
+# optimize_thresholds.py: its current selection lives in threshold_optimization.txt,
+# and the weekly pipeline reads that file rather than these constants, so treat a
+# bare `python backtest.py` as "whatever is written below", not "what we trade".
+# A "hold until opposite" policy trades far less than "flat" and is the only kind
+# that survives realistic slippage.
 BUY_THRESHOLD = 0.75
 SELL_THRESHOLD = 0.20
 POLICY = "hold"                # "hold" = hold until opposite signal; "flat" = exit in the neutral zone
@@ -214,12 +221,13 @@ def write_results(
     metrics: dict,
     buy_threshold: float = BUY_THRESHOLD,
     sell_threshold: float = SELL_THRESHOLD,
+    policy: str = POLICY,
 ) -> None:
     lines = [
         "Gradient-value strategy backtest — ES futures",
         "=" * 60,
         f"Rule: p>={buy_threshold:.2f} long, p<={sell_threshold:.2f} short, "
-        f"else {'hold' if POLICY == 'hold' else 'flat'} (long & short, '{POLICY}' policy)",
+        f"else {'hold' if policy == 'hold' else 'flat'} (long & short, '{policy}' policy)",
         f"Sizing: 1 contract | ${POINT_VALUE:.0f}/pt",
         f"Costs:  ${COMMISSION_PER_CONTRACT:.2f} commission + {SLIPPAGE_TICKS:.2f} tick "
         f"(${SLIPPAGE_TICKS * TICK_VALUE:.2f}) slippage per fill",
@@ -261,14 +269,28 @@ def plot_equity(equity: np.ndarray) -> None:
     print(f"Equity curve saved to {EQUITY_PNG}")
 
 
+def parse_args() -> argparse.Namespace:
+    """Defaults are the module constants, so a bare run behaves exactly as before."""
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--buy", type=float, default=BUY_THRESHOLD,
+                        help=f"go long when p >= this (default {BUY_THRESHOLD})")
+    parser.add_argument("--sell", type=float, default=SELL_THRESHOLD,
+                        help=f"go short when p <= this (default {SELL_THRESHOLD})")
+    parser.add_argument("--policy", choices=("hold", "flat"), default=POLICY,
+                        help=f"what to do in the neutral zone (default {POLICY})")
+    return parser.parse_args()
+
+
 def main() -> None:
+    args = parse_args()
+    print(f"Thresholds: buy>={args.buy:.2f}  sell<={args.sell:.2f}  policy={args.policy}")
     print("Loading model and test split ...")
     close, probabilities = load_test_split()
-    positions = build_positions(probabilities)
+    positions = build_positions(probabilities, args.buy, args.sell, args.policy)
     result = simulate(close, positions)
     metrics = summarize(close, positions, result)
     print()
-    write_results(metrics)
+    write_results(metrics, args.buy, args.sell, args.policy)
     plot_equity(result["equity"])
 
 
