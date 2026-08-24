@@ -11,6 +11,9 @@
 #   4. gradient_value/prepare_data.py
 #   5. gradient_value/train_predictor.py
 #   6. gradient_value/optimize_thresholds.py  (produces the buy/sell grid)
+#   6b. compare_backtest.py       (backtests the thresholds currently in
+#                                   futures_trader.py against the new ones,
+#                                   report only -- changes nothing)
 #   7. propose_thresholds.py      (applies the thresholds to futures_trader.py
 #                                   if they pass sanity checks; otherwise
 #                                   refuses and leaves the file untouched)
@@ -237,6 +240,18 @@ run_step "4_prepare_data"       "$GRAD_DIR" "$IBKR_PY" "$GRAD_DIR/prepare_data.p
 run_step "5_train_predictor"    "$GRAD_DIR" "$IBKR_PY" "$GRAD_DIR/train_predictor.py"
 run_step "6_optimize_thresholds" "$GRAD_DIR" "$IBKR_PY" "$GRAD_DIR/optimize_thresholds.py"
 
+# --- step 6b: what would the proposed change actually buy? ---------------------
+# Step 6 reports the proposal on its own, which says nothing about whether it
+# beats what the trader is already using. This scores both on the same fresh
+# data. It must run BEFORE step 7, which overwrites the incumbent values.
+run_step "6b_compare_backtest" "$HERE" "$IBKR_PY" "$HERE/compare_backtest.py" \
+    --results       "$GRAD_DIR/threshold_optimization.txt" \
+    --trader        "$TRADER_PY" \
+    --gradient-dir  "$GRAD_DIR" \
+    --report-dir    "$REPORT_DIR" \
+    --min-mtime     "$RUN_START_EPOCH" \
+    --run-id        "$RUN_ID"
+
 # --- step 7: apply thresholds if they pass sanity checks -----------------------
 run_step "7_propose_thresholds" "$HERE" "$MODEL_PY" "$HERE/propose_thresholds.py" \
     --results     "$GRAD_DIR/threshold_optimization.txt" \
@@ -249,6 +264,7 @@ run_step "7_propose_thresholds" "$HERE" "$MODEL_PY" "$HERE/propose_thresholds.py
 log "============================================================="
 log "RUN COMPLETE"
 log "Report:   $REPORT_DIR/latest_recommendation.md"
+log "Backtest: $REPORT_DIR/latest_backtest_comparison.md (incumbent vs proposed)"
 log "Full log: $LOG"
 log "See the report above for whether futures_trader.py was updated."
 log "Restart the trader for any threshold change to take effect — this script never does."
