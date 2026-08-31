@@ -16,6 +16,12 @@ optimize_thresholds.py reports on, and the only span neither configuration was
 tuned on. The incumbent is scored under the proposed policy so the two differ
 only in their thresholds.
 
+Every run's scores are appended to backtest_history.json, and the report carries
+a second table comparing the incumbent's numbers now against the last run that
+scored those same thresholds. A configuration that looked strong when it was
+selected and is weak a week later was fitting noise, which no single run's
+report can reveal.
+
 Reads nothing from TWS, places no orders, and modifies no source file. It only
 writes its report.
 
@@ -27,6 +33,7 @@ Exit codes:
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -56,6 +63,10 @@ METRIC_ROWS = [
     ("Sharpe (annualized)", "sharpe_annualized", "{:.2f}"),
     ("Max drawdown", "max_drawdown", "${:,.0f}"),
 ]
+
+
+# Every run appends one record here so later runs can detect decay.
+HISTORY_FILENAME = "backtest_history.json"
 
 
 class ReportColumn(NamedTuple):
@@ -98,6 +109,74 @@ def format_delta(incumbent_value: float, proposed_value: float, number_format: s
     if difference == 0:
         return "—"
     return ("+" if difference > 0 else "-") + number_format.format(abs(difference))
+
+
+def load_history(report_dir: Path) -> list[dict]:
+    """Past runs, oldest first. A missing or unreadable file just means no history."""
+    history_path = report_dir / HISTORY_FILENAME
+    if not history_path.exists():
+        return []
+    try:
+        records = json.loads(history_path.read_text())
+    except (json.JSONDecodeError, OSError) as error:
+        print(f"Warning: ignoring unreadable {HISTORY_FILENAME} ({error})")
+        return []
+    return records if isinstance(records, list) else []
+
+
+def append_history(report_dir: Path, record: dict, history: list[dict]) -> None:
+    (report_dir / HISTORY_FILENAME).write_text(json.dumps(history + [record], indent=2))
+
+
+def matches(configuration: dict, buy: float, sell: float) -> bool:
+    """Thresholds come from text on both sides, so compare at the precision shown."""
+    return (round(configuration["buy"], 4) == round(buy, 4)
+            and round(configuration["sell"], 4) == round(sell, 4))
+
+
+def find_previous_scoring(history: list[dict], buy: float, sell: float) -> dict | None:
+    """The most recent earlier run that scored these exact thresholds, if any."""
+    for record in reversed(history):
+        for configuration in record.get("configurations", []):
+            if matches(configuration, buy, sell):
+                return {
+                    "run_id": record["run_id"],
+                    "n_bars": record["n_bars"],
+                    "role": configuration["role"],
+                    "metrics": configuration["metrics"],
+                }
+    return None
+
+
+def render_week_over_week(previous: dict, current: dict, buy: float, sell: float,
+                          current_bars: int, current_run_id: str) -> list[str]:
+    """Same thresholds, previous run's data vs this run's."""
+    lines = [
+        "",
+        f"## Same thresholds ({buy:.2f} / {sell:.2f}), run over run",
+        "",
+        f"Scored as the **{previous['role']}** in run `{previous['run_id']}` "
+        f"({previous['n_bars']:,} bars), and as the incumbent now "
+        f"({current_bars:,} bars).",
+        "",
+        f"| Metric | {previous['run_id']} | {current_run_id} | Delta |",
+        "|---|---|---|---|",
+    ]
+    for display_name, key, number_format in METRIC_ROWS:
+        before, after = previous["metrics"].get(key), current[key]
+        if before is None:
+            continue
+        lines.append(
+            f"| {display_name} | {number_format.format(before)} | "
+            f"{number_format.format(after)} | {format_delta(before, after, number_format)} |"
+        )
+    lines += [
+        "",
+        "_The model was retrained and the test window moved between these runs, so "
+        "this is not a controlled comparison. It is still the clearest signal "
+        "available that a selection is decaying rather than holding up._",
+    ]
+    return lines
 
 
 def choose_columns(
@@ -163,6 +242,7 @@ def build_report(
     policy: str,
     n_bars: int,
     run_id: str,
+    week_over_week: list[str] | None = None,
 ) -> str:
     lines = [
         f"# Backtest — incumbent vs proposed thresholds ({run_id})",
@@ -174,6 +254,11 @@ def build_report(
     if note:
         lines += [note, ""]
     lines += render_table(columns)
+    lines += week_over_week or [
+        "",
+        "_No earlier run has scored these thresholds yet, so there is no run-over-run "
+        "comparison. The next run will have one._",
+    ]
     lines += [
         "",
         "_Backtested thresholds describe past data. This is not a forecast, and it "
@@ -214,11 +299,41 @@ def main() -> None:
         incumbent, proposed,
         (incumbent_buy, incumbent_sell), (proposed_buy, proposed_sell),
     )
-    report = build_report(columns, note, policy, len(close), args.run_id)
 
     args.report_dir.mkdir(parents=True, exist_ok=True)
+    history = load_history(args.report_dir)
+
+    # Track the incumbent: it is normally the previous run's proposal, so this is
+    # where a selection that decayed since it was chosen becomes visible.
+    week_over_week = None
+    if incumbent is not None:
+        previous = find_previous_scoring(history, incumbent_buy, incumbent_sell)
+        if previous is not None:
+            week_over_week = render_week_over_week(
+                previous, incumbent, incumbent_buy, incumbent_sell,
+                len(close), args.run_id,
+            )
+
+    report = build_report(columns, note, policy, len(close), args.run_id, week_over_week)
+
     (args.report_dir / f"backtest_comparison_{args.run_id}.md").write_text(report)
     (args.report_dir / "latest_backtest_comparison.md").write_text(report)
+
+    # Proposed first, so a later run matching both reports the more meaningful role.
+    configurations = [
+        {"role": "proposed", "buy": proposed_buy, "sell": proposed_sell,
+         "policy": policy, "metrics": proposed},
+    ]
+    if incumbent is not None:
+        configurations.append(
+            {"role": "incumbent", "buy": incumbent_buy, "sell": incumbent_sell,
+             "policy": policy, "metrics": incumbent}
+        )
+    append_history(args.report_dir, {
+        "run_id": args.run_id,
+        "n_bars": len(close),
+        "configurations": configurations,
+    }, history)
 
     print(report)
     print(f"Saved to {args.report_dir / 'latest_backtest_comparison.md'}")
