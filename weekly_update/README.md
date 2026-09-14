@@ -2,8 +2,8 @@
 
 Runs the full model refresh every **Monday at 08:00** and applies the new
 buy/sell probability thresholds to `futures_trader.py`, if they pass sanity
-checks. It never restarts the running trader — that stays a manual step — and
-it never places orders.
+checks and a held-out backtest. It never restarts the running trader — that
+stays a manual step — and it never places orders.
 
 ## Install
 
@@ -45,14 +45,15 @@ launchctl bootout gui/$(id -u)/com.abeadam.stockmodel.weekly
 | 4 | `gradient_value/prepare_data.py` | ibkr venv |
 | 5 | `gradient_value/train_predictor.py` | ibkr venv |
 | 6 | `gradient_value/optimize_thresholds.py` | ibkr venv |
-| 7 | `propose_thresholds.py` — applies the new thresholds if sane | Stock-Model venv |
+| 6b | `compare_backtest.py` — scores the current and proposed thresholds on the same held-out bars | ibkr venv |
+| 7 | `propose_thresholds.py` — applies the new thresholds if they pass every check | Stock-Model venv |
 
 **What step 6 produces.** `optimize_thresholds.py` grids buy/sell probability
 thresholds on a validation split and writes
 `Chosen: policy=... buy=... sell=...` to
 `gradient_value/threshold_optimization.txt`. Step 7 parses that line, sanity-checks
-it, backs up `futures_trader.py`, and — if the checks pass — rewrites the two
-threshold constants in place.
+it, checks step 6b's held-out backtest of it, backs up `futures_trader.py`, and —
+if every check passes — rewrites the two threshold constants in place.
 
 (There used to be a step 6 running `future_prices/model_tester.py` for an RL
 agent P&L report, with `optimize_thresholds.py` as "6b". That RL agent's
@@ -91,6 +92,8 @@ Two distinct failure modes are checked, because they need different fixes:
 weekly_update/
 ├── logs/       run_<timestamp>.log  (driver)  +  one log per step
 ├── reports/    thresholds_<timestamp>.md, latest_recommendation.md, .json
+│               backtest_comparison_<timestamp>.md, latest_backtest_comparison.md,
+│               backtest_history.json  (step 6b's scores; step 7 gates on them)
 └── backups/    futures_trader_<timestamp>.py  (copy taken every run)
 ```
 
@@ -133,10 +136,16 @@ the practical ceiling of what's recoverable at this granularity, not an
 arbitrary choice.
 - A lock directory prevents two runs overlapping.
 - Step 7 refuses to apply from a `threshold_optimization.txt` older than the
-  current run, and refuses to touch `futures_trader.py` (exit 3) if the
-  proposed pair fails sanity checks (buy outside 0.50–0.95, sell outside
-  0.05–0.50, or buy ≤ sell) — `futures_trader.py` is backed up every run
-  regardless of whether it ends up changed.
+  current run, and refuses to touch `futures_trader.py` (exit 3, which fails
+  the run) if the proposed pair fails a check:
+  - sanity: buy outside 0.50–0.95, sell outside 0.05–0.50, or buy ≤ sell;
+  - held-out backtest (step 6b, this run): the proposal's net P&L is negative,
+    is lower than the current thresholds' net P&L, or is missing. A negative
+    net P&L fails the run even when the optimizer re-picked the current
+    thresholds, since that means the live values lose money on held-out data.
+
+  `futures_trader.py` is backed up every run regardless of whether it ends up
+  changed.
 
 ## Requirements on Monday morning
 

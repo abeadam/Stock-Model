@@ -15,8 +15,10 @@
 #                                   futures_trader.py against the new ones,
 #                                   report only -- changes nothing)
 #   7. propose_thresholds.py      (applies the thresholds to futures_trader.py
-#                                   if they pass sanity checks; otherwise
-#                                   refuses and leaves the file untouched)
+#                                   if they pass sanity checks and, in step
+#                                   6b's held-out backtest, make money and beat
+#                                   the current thresholds; otherwise refuses
+#                                   and leaves the file untouched)
 #
 # Failure policy: stop on first failure, log everything, exit non-zero.
 # This script NEVER restarts the running trader and NEVER places an order —
@@ -46,6 +48,7 @@ LOG_DIR="$HERE/logs"
 REPORT_DIR="$HERE/reports"
 BACKUP_DIR="$HERE/backups"
 LOCK_DIR="$HERE/.run.lock"
+BACKTEST_HISTORY="$REPORT_DIR/backtest_history.json"   # step 6b appends; step 7 gates on it
 
 # launchd gives a bare environment — make it look like a login shell.
 export PATH="/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
@@ -252,14 +255,18 @@ run_step "6b_compare_backtest" "$HERE" "$IBKR_PY" "$HERE/compare_backtest.py" \
     --min-mtime     "$RUN_START_EPOCH" \
     --run-id        "$RUN_ID"
 
-# --- step 7: apply thresholds if they pass sanity checks -----------------------
+# --- step 7: apply thresholds only if they pass every check --------------------
+# Sanity ranges, plus step 6b's held-out backtest of this run: refused if the
+# proposal loses money on the untouched half, or earns less there than the
+# thresholds already in futures_trader.py.
 run_step "7_propose_thresholds" "$HERE" "$MODEL_PY" "$HERE/propose_thresholds.py" \
-    --results     "$GRAD_DIR/threshold_optimization.txt" \
-    --trader      "$TRADER_PY" \
-    --report-dir  "$REPORT_DIR" \
-    --backup-dir  "$BACKUP_DIR" \
-    --min-mtime   "$RUN_START_EPOCH" \
-    --run-id      "$RUN_ID"
+    --results          "$GRAD_DIR/threshold_optimization.txt" \
+    --trader           "$TRADER_PY" \
+    --report-dir       "$REPORT_DIR" \
+    --backup-dir       "$BACKUP_DIR" \
+    --backtest-history "$BACKTEST_HISTORY" \
+    --min-mtime        "$RUN_START_EPOCH" \
+    --run-id           "$RUN_ID"
 
 log "============================================================="
 log "RUN COMPLETE"

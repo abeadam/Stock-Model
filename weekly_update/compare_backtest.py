@@ -47,6 +47,7 @@ from propose_thresholds import (  # noqa: E402
     fail,
     parse_current_thresholds,
     parse_results,
+    thresholds_match,
 )
 
 # Rows of the comparison table: (display name, metrics key, number format).
@@ -128,17 +129,11 @@ def append_history(report_dir: Path, record: dict, history: list[dict]) -> None:
     (report_dir / HISTORY_FILENAME).write_text(json.dumps(history + [record], indent=2))
 
 
-def matches(configuration: dict, buy: float, sell: float) -> bool:
-    """Thresholds come from text on both sides, so compare at the precision shown."""
-    return (round(configuration["buy"], 4) == round(buy, 4)
-            and round(configuration["sell"], 4) == round(sell, 4))
-
-
 def find_previous_scoring(history: list[dict], buy: float, sell: float) -> dict | None:
     """The most recent earlier run that scored these exact thresholds, if any."""
     for record in reversed(history):
         for configuration in record.get("configurations", []):
-            if matches(configuration, buy, sell):
+            if thresholds_match(configuration, buy, sell):
                 return {
                     "run_id": record["run_id"],
                     "n_bars": record["n_bars"],
