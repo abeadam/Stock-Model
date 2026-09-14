@@ -83,13 +83,13 @@ def main():
     N_FOLDS = 10
     
     # Grid search over number of top features (by |correlation| with target)
-    SEARCH_TOP_N_FEATURES = True  # If True, optimize USE_TOP_N_FEATURES via CV; else use fixed value below
+    SEARCH_TOP_N_FEATURES = False  # If True, optimize USE_TOP_N_FEATURES via CV; else use fixed value below
     TOP_N_CANDIDATES = [None, 20, 30, 40, 60, 80]  # None = use all features
     N_FOLDS_TOP_N_SEARCH = 3       # Folds used when searching TOP_N (fewer = faster)
 
     # Use ALL features so inference in prepare_data.py can call prepare_features_and_target
     # and pass the matrix directly without any positional-order ambiguity.
-    USE_TOP_N_FEATURES = 30  # None = use all features
+    USE_TOP_N_FEATURES = None  # None = use all features
     
     # Base train kwargs (L1/L2 may be overridden when using limited feature set)
     base_train_kwargs = dict(
