@@ -50,6 +50,8 @@ REPORT_DIR="$HERE/reports"
 BACKUP_DIR="$HERE/backups"
 LOCK_DIR="$HERE/.run.lock"
 BACKTEST_HISTORY="$REPORT_DIR/backtest_history.json"   # step 6b appends; step 7 gates on it
+THRESHOLDS_REFUSED_EXIT=3   # propose_thresholds.py exit code when a check refuses the new thresholds
+NOTIFICATION_TITLE="Stock-Model weekly update"
 
 # What a retrain replaces: the models futures_trader.py loads, plus each LightGBM
 # model's importance CSV (the live feature contract, and the ranking the next
@@ -81,6 +83,18 @@ log() { printf '[%s] %s\n' "$(date '+%F %T')" "$*" | tee -a "$LOG"; }
 
 cleanup() { rm -rf "$LOCK_DIR" 2>/dev/null || true; }
 
+# notify_user <message>
+# Posts a macOS notification. Under launchd nobody is watching the log, so a
+# failed run has to surface somewhere a person will see it. Best effort: a
+# notification that cannot be shown never changes how the run ends.
+notify_user() {
+    osascript - "$NOTIFICATION_TITLE" "$1" >/dev/null 2>&1 <<'OSA' || true
+on run argv
+    display notification (item 2 of argv) with title (item 1 of argv)
+end run
+OSA
+}
+
 # Take the lock, but don't let a lock orphaned by a crash (or a kill -9) block
 # every future Monday: if the recorded pid is gone, the lock is stale.
 acquire_lock() {
@@ -111,6 +125,7 @@ die() {
     [ -z "$MODEL_BACKUP_TAKEN" ] || log "Models from before this run's retrain: $MODEL_BACKUP_DIR"
     log "Full log: $LOG"
     log "-------------------------------------------------------------"
+    notify_user "RUN FAILED: $*"
     cleanup
     exit 1
 }
@@ -147,6 +162,21 @@ scan_for_swallowed_errors() {
     return 0
 }
 
+# describe_step_failure <label> <exit code> <step log>
+# The RUN FAILED headline for a step that exited non-zero. When step 7 refuses
+# the new thresholds, the headline says so and gives its reasons, so the failure
+# reads as the safety check it is rather than as a crash.
+describe_step_failure() {
+    local label="$1" rc="$2" step_log="$3" reasons
+    reasons="$(sed -n 's/^CHECK FAILED: //p' "$step_log" | paste -sd ';' - | sed 's/;/; /g')"
+    if [ "$rc" -eq "$THRESHOLDS_REFUSED_EXIT" ] && [ -n "$reasons" ]; then
+        printf 'new thresholds REFUSED, futures_trader.py keeps its current values: %s (report: %s)' \
+            "$reasons" "$REPORT_DIR/latest_recommendation.md"
+    else
+        printf 'step %s exited with code %s (see %s)' "$label" "$rc" "$step_log"
+    fi
+}
+
 # run_step <label> <workdir> <interpreter> <script> [args...]
 # Runs one step with a timeout, streams output to its own log, then verifies
 # both the exit code and the output text.
@@ -181,7 +211,7 @@ run_step() {
     wait "$pid"; local rc=$?
 
     tail -5 "$step_log" | sed 's/^/    | /' | tee -a "$LOG" >/dev/null
-    [ "$rc" -eq 0 ] || die "step $label exited with code $rc (see $step_log)"
+    [ "$rc" -eq 0 ] || die "$(describe_step_failure "$label" "$rc" "$step_log")"
     scan_for_swallowed_errors "$step_log" || die "step $label reported an error in its output (see $step_log)"
 
     log "STEP $label — OK"

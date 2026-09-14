@@ -236,9 +236,12 @@ def held_out_check(buy: float, sell: float,
 
     problems: list[str] = []
     proposed_pnl = proposed["metrics"]["net_pnl"]
+    unchanged = (cur_buy is not None and cur_sell is not None
+                 and thresholds_match({"buy": cur_buy, "sell": cur_sell}, buy, sell))
     if proposed_pnl < MIN_HELD_OUT_NET_PNL:
-        problems.append(f"proposed {buy:.2f} / {sell:.2f} loses money on the held-out half "
-                        f"(net P&L ${proposed_pnl:,.0f})")
+        subject = (f"the current {buy:.2f} / {sell:.2f}, which the optimizer re-picked and the trader "
+                   f"is running on," if unchanged else f"proposed {buy:.2f} / {sell:.2f}")
+        problems.append(f"{subject} loses money on the held-out half (net P&L ${proposed_pnl:,.0f})")
 
     if cur_buy is None or cur_sell is None:
         return problems  # sanity_check already reports the unreadable current values
@@ -268,6 +271,10 @@ def build_report(res: dict, cur_buy, cur_sell,
     if applied:
         out += [f"**`futures_trader.py` was updated.** Backup: `{backup_path}`.",
                 "Restart the trader for the change to take effect — this script never does.", ""]
+    elif problems:
+        out += ["**RUN FAILED — the new thresholds were refused, so `futures_trader.py` was NOT modified.**",
+                f"The trader keeps {fmt(cur_buy)} / {fmt(cur_sell)}. The run fails on purpose so this is "
+                "not missed; it is a safety check stopping a change, not a crash. Reasons below.", ""]
     else:
         out += ["**`futures_trader.py` was NOT modified.**", ""]
 
@@ -409,7 +416,8 @@ def main() -> None:
     if problems:
         for problem in problems:
             print(f"CHECK FAILED: {problem}")
-        print("futures_trader.py was NOT modified — fix the underlying issue and rerun.")
+        print("futures_trader.py was NOT modified and keeps its current thresholds. "
+              "The run fails on purpose so the refusal is not missed.")
         sys.exit(3)
     elif applied:
         print("futures_trader.py UPDATED. Restart the trader for the change to take effect.")

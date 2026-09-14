@@ -164,6 +164,14 @@ arbitrary choice.
   `futures_trader.py` is backed up every run regardless of whether it ends up
   changed.
 
+  A refusal fails the run on purpose, and says so rather than looking like a
+  crash: the run log's headline reads `RUN FAILED: new thresholds REFUSED,
+  futures_trader.py keeps its current values: <reasons>`, and
+  `latest_recommendation.md` opens with the same verdict.
+- Every failed run also posts a macOS notification with its RUN FAILED
+  headline, since under launchd nobody is watching the log. It is best effort:
+  if notifications are blocked, the run still ends the same way.
+
 ## Requirements on Monday morning
 
 - TWS or IB Gateway running, API enabled, socket port 7497.
