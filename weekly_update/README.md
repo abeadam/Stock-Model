@@ -40,6 +40,7 @@ launchctl bootout gui/$(id -u)/com.abeadam.stockmodel.weekly
 | 0 | preflight: TWS reachable on 127.0.0.1:7497 | — |
 | 1 | `download_daily.py` — pulls each symbol-day into `daily_data/`, skipping days already on disk | ibkr venv |
 | 2 | `future_prices/futures_price.py` | Stock-Model venv |
+| 2b | back up the current models to `backups/models_<timestamp>/` before anything retrains | — |
 | 3 | `basic_model/lightgbm_model_highest.py` + `lightgbm_model_lowest.py`, concurrently | ibkr venv |
 | 3b | `verify_live_features.py` — every feature the new models selected must be computable live | ibkr venv |
 | 4 | `gradient_value/prepare_data.py` | ibkr venv |
@@ -95,12 +96,28 @@ weekly_update/
 │               backtest_comparison_<timestamp>.md, latest_backtest_comparison.md,
 │               backtest_history.json  (step 6b's scores; step 7 gates on them)
 └── backups/    futures_trader_<timestamp>.py  (copy taken every run)
+                models_<timestamp>/basic_model/, models_<timestamp>/gradient_value/
+                                                (models as they were before step 3)
 ```
 
 Read `reports/latest_recommendation.md` each Monday to see whether
 `futures_trader.py` was updated (and why, if it wasn't). If it was updated,
 **restart the trader** — it only reads the thresholds at startup, and this
 pipeline never restarts it for you.
+
+## Rolling back a retrain
+
+Steps 3 and 5 overwrite the models in place, and `*.pkl` is gitignored, so step 2b
+is the only copy of the previous models. To put a run's predecessors back
+(substitute the run's timestamp):
+
+```bash
+cp -p /Users/abeadam/dev/model/Stock-Model/weekly_update/backups/models_<timestamp>/basic_model/* /Users/abeadam/dev/model/Stock-Model/future_prices/basic_model/
+cp -p /Users/abeadam/dev/model/Stock-Model/weekly_update/backups/models_<timestamp>/gradient_value/* /Users/abeadam/dev/model/Stock-Model/future_prices/gradient_value/
+```
+
+The trader loads its models the first time it predicts and keeps them, so a
+restart picks up whichever models are on disk — restored or retrained.
 
 ## Failure behaviour
 

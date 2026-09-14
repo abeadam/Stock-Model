@@ -6,6 +6,7 @@
 #   0. Preflight: TWS/IB Gateway reachable on 127.0.0.1:7497
 #   1. download_daily.py          (IBKR day-by-day historical pull into daily_data/)
 #   2. futures_price.py           (indicator build)
+#   2b. back up the trained models (steps 3 and 5 overwrite them in place)
 #   3. lightgbm_model_highest.py  ] run concurrently
 #      lightgbm_model_lowest.py   ]
 #   4. gradient_value/prepare_data.py
@@ -50,6 +51,18 @@ BACKUP_DIR="$HERE/backups"
 LOCK_DIR="$HERE/.run.lock"
 BACKTEST_HISTORY="$REPORT_DIR/backtest_history.json"   # step 6b appends; step 7 gates on it
 
+# What a retrain replaces: the models futures_trader.py loads, plus each LightGBM
+# model's importance CSV (the live feature contract, and the ranking the next
+# retrain searches over). Steps 3 and 5 overwrite these in place and *.pkl is
+# gitignored, so step 2b copying them aside is the only way to roll back.
+MODEL_ARTIFACTS=(
+    "$BASIC_DIR/lightgbm_model_highest.pkl"
+    "$BASIC_DIR/lightgbm_model_highest_feature_importances_splits_and_gain.csv"
+    "$BASIC_DIR/lightgbm_model_lowest.pkl"
+    "$BASIC_DIR/lightgbm_model_lowest_feature_importances_splits_and_gain.csv"
+    "$GRAD_DIR/predictor_model.pkl"
+)
+
 # launchd gives a bare environment — make it look like a login shell.
 export PATH="/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 export HOME="${HOME:-/Users/abeadam}"
@@ -60,6 +73,8 @@ mkdir -p "$LOG_DIR" "$REPORT_DIR" "$BACKUP_DIR"
 RUN_ID="$(date '+%Y-%m-%d_%H%M%S')"
 LOG="$LOG_DIR/run_$RUN_ID.log"
 RUN_START_EPOCH="$(date '+%s')"
+MODEL_BACKUP_DIR="$BACKUP_DIR/models_$RUN_ID"
+MODEL_BACKUP_TAKEN=""   # set by backup_models once a copy exists; die() then points at it
 
 # ---------------------------------------------------------------------- helpers
 log() { printf '[%s] %s\n' "$(date '+%F %T')" "$*" | tee -a "$LOG"; }
@@ -93,6 +108,7 @@ die() {
     log "-------------------------------------------------------------"
     log "RUN FAILED: $*"
     log "Nothing downstream was run. futures_trader.py was NOT modified."
+    [ -z "$MODEL_BACKUP_TAKEN" ] || log "Models from before this run's retrain: $MODEL_BACKUP_DIR"
     log "Full log: $LOG"
     log "-------------------------------------------------------------"
     cleanup
@@ -171,6 +187,32 @@ run_step() {
     log "STEP $label — OK"
 }
 
+# backup_models
+# Copies every MODEL_ARTIFACTS file to $MODEL_BACKUP_DIR/<its directory name>/.
+# A file that doesn't exist yet is noted and skipped. A copy that fails stops the
+# run before anything is retrained, since a retrain without a copy can't be
+# rolled back.
+backup_models() {
+    log "STEP 2b — backing up current models to $MODEL_BACKUP_DIR"
+    local artifact destination saved=0
+    for artifact in "${MODEL_ARTIFACTS[@]}"; do
+        if [ ! -e "$artifact" ]; then
+            log "  not present, nothing to back up: $artifact"
+            continue
+        fi
+        destination="$MODEL_BACKUP_DIR/$(basename "$(dirname "$artifact")")"
+        mkdir -p "$destination" && cp -p "$artifact" "$destination/" \
+            || die "could not back up $artifact to $destination — refusing to retrain without a copy"
+        log "  saved $destination/$(basename "$artifact")"
+        saved=$((saved + 1))
+    done
+    if [ "$saved" -gt 0 ]; then
+        MODEL_BACKUP_TAKEN=1
+        log "  restore: cp -p \"$MODEL_BACKUP_DIR/basic_model/\"* \"$BASIC_DIR/\" && cp -p \"$MODEL_BACKUP_DIR/gradient_value/\"* \"$GRAD_DIR/\""
+    fi
+    log "STEP 2b — OK ($saved of ${#MODEL_ARTIFACTS[@]} files saved)"
+}
+
 # ------------------------------------------------------------------- preflight
 log "============================================================="
 log "Weekly Stock-Model update — run $RUN_ID"
@@ -205,6 +247,9 @@ fi
 run_step "1_download_daily_data" "$HERE" "$IBKR_PY" "$IBKR_ROOT/Updated Stats/download_daily.py"
 
 run_step "2_futures_price" "$FP_DIR" "$MODEL_PY" "$FP_DIR/futures_price.py"
+
+# --- step 2b: keep a copy of the models this run is about to replace -----------
+backup_models
 
 # --- step 3: the two LightGBM trainings run concurrently -----------------------
 log "STEP 3 — starting lightgbm_model_highest.py and lightgbm_model_lowest.py concurrently"
@@ -272,6 +317,7 @@ log "============================================================="
 log "RUN COMPLETE"
 log "Report:   $REPORT_DIR/latest_recommendation.md"
 log "Backtest: $REPORT_DIR/latest_backtest_comparison.md (incumbent vs proposed)"
+log "Models:   $MODEL_BACKUP_DIR (as they were before this run's retrain)"
 log "Full log: $LOG"
 log "See the report above for whether futures_trader.py was updated."
 log "Restart the trader for any threshold change to take effect — this script never does."
