@@ -312,7 +312,8 @@ log "STEP 3 — OK (both models trained)"
 # with that column silently NaN-filled. Catch it here, while the cause is
 # obvious, instead of discovering it weeks later in live behaviour.
 run_step "3b_verify_live_features" "$HERE" "$IBKR_PY" "$HERE/verify_live_features.py" \
-    --basic-model-dir "$BASIC_DIR"
+    --basic-model-dir "$BASIC_DIR" \
+    --trader         "$TRADER_PY"
 
 run_step "4_prepare_data"       "$GRAD_DIR" "$IBKR_PY" "$GRAD_DIR/prepare_data.py"
 run_step "5_train_predictor"    "$GRAD_DIR" "$IBKR_PY" "$GRAD_DIR/train_predictor.py"

@@ -30,6 +30,7 @@ Exit codes:
 from __future__ import annotations
 
 import argparse
+import re
 import sys
 from pathlib import Path
 
@@ -37,10 +38,15 @@ import numpy as np
 import pandas as pd
 
 # Bars of synthetic history to probe with. The longest warmup among the shared
-# indicators is 50 (BB_50 / Volatility_50 / rolling-50), so this leaves ample
-# room for the final row to be fully populated.
+# indicators is the rolling-50 group at 51 bars, so this leaves ample room for
+# the final row to be fully populated.
 PROBE_BARS = 150
 MODEL_KINDS = ("highest", "lowest")
+
+# The trader refuses to predict below this many bars. Keeping the two in step
+# matters: if a retrain selects a longer-warmup feature, the trader would go on
+# predicting at its old minimum with that feature NaN.
+TRADER_MIN_BARS_RE = re.compile(r"^MIN_BARS_FOR_PREDICTION\s*=\s*(\d+)", re.MULTILINE)
 
 
 def parse_args() -> argparse.Namespace:
@@ -48,6 +54,9 @@ def parse_args() -> argparse.Namespace:
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--basic-model-dir", type=Path, required=True,
                    help="directory holding es_features.py and the trained model files")
+    p.add_argument("--trader", type=Path, default=None,
+                   help="futures_trader.py; when given, its MIN_BARS_FOR_PREDICTION "
+                        "must be at least the warmup the new feature set needs")
     return p.parse_args()
 
 
@@ -117,6 +126,49 @@ def check_model(es_features, model_kind: str, probe: pd.DataFrame) -> list[str]:
     return problems
 
 
+def minimum_clean_bars(es_features, model_kind: str, cap: int = PROBE_BARS) -> int | None:
+    """Fewest bars whose final feature row has no NaN, or None if never within cap."""
+    for count in range(2, cap + 1):
+        try:
+            matrix, _ = es_features.compute_es_features(
+                build_probe_bars(count), model_kind=model_kind, print_time=False
+            )
+        except Exception:
+            continue  # too little history for an indicator to evaluate at all
+        if not np.isnan(matrix[-1]).any():
+            return count
+    return None
+
+
+def check_trader_min_bars(es_features, trader: Path) -> list[str]:
+    """Compare the trader's configured minimum against what the features now need."""
+    if not trader.exists():
+        fail(f"trader not found: {trader}")
+    match = TRADER_MIN_BARS_RE.search(trader.read_text())
+    if not match:
+        fail(f"no MIN_BARS_FOR_PREDICTION assignment found in {trader}")
+    configured = int(match.group(1))
+
+    problems: list[str] = []
+    for model_kind in MODEL_KINDS:
+        needed = minimum_clean_bars(es_features, model_kind)
+        if needed is None:
+            problems.append(
+                f"{model_kind}: no bar count up to {PROBE_BARS} produces a complete "
+                f"feature row — some feature never populates"
+            )
+            continue
+        verdict = "ok" if configured >= needed else "TOO LOW"
+        print(f"  {model_kind}: needs {needed} bars, trader keeps {configured} ({verdict})")
+        if configured < needed:
+            problems.append(
+                f"{model_kind}: needs {needed} bars for a complete feature row, but "
+                f"futures_trader.py MIN_BARS_FOR_PREDICTION is {configured} — raise it "
+                f"to at least {needed}"
+            )
+    return problems
+
+
 def main() -> None:
     args = parse_args()
     basic_model_dir = args.basic_model_dir.resolve()
@@ -142,6 +194,11 @@ def main() -> None:
             fail(f"{model_kind}: {exc}")
         except Exception as exc:
             fail(f"{model_kind}: feature check raised {type(exc).__name__}: {exc}")
+
+    if args.trader is not None:
+        print()
+        print("Checking the trader keeps enough history for that feature set ...")
+        problems.extend(check_trader_min_bars(es_features, args.trader))
 
     if problems:
         print()
