@@ -14,9 +14,14 @@ import matplotlib
 matplotlib.use('Agg')  # non-interactive backend — safe for headless runs
 import matplotlib.pyplot as plt
 import glob
+import sys
+from pathlib import Path
 from typing import Optional
 from datetime import datetime
 import pytz
+
+sys.path.insert(0, str(Path(__file__).resolve().parent / "basic_model"))
+from session_features import session_features_for_bars, session_ranges  # noqa: E402
 
 
 def load_es_data(data_dir: str = 'daily_data') -> pd.DataFrame:
@@ -487,6 +492,18 @@ def calculate_trading_hours(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def add_session_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Add the session_features columns, computed on US/Eastern bar times.
+
+    Uses the same function as the live trader (es_features.py), so the two
+    cannot compute them differently. Prior-session ranges come from these same
+    bars, which are the daily_data files live code reads them from.
+    """
+    eastern_times = df['DateTime_ET'].dt.tz_localize(None)
+    history = session_ranges(eastern_times, df['High'], df['Low'])
+    return df.assign(**session_features_for_bars(eastern_times, df, history))
+
+
 def extract_cyclical_time_features(df: pd.DataFrame) -> pd.DataFrame:
     """
     Extract cyclical time features (hour, day, month) from datetime columns.
@@ -765,6 +782,7 @@ def main():
         # Process all technical indicators using the shared function
         initial_len = len(df)
         df = process_stock_indicators(df, "ES")
+        df = add_session_features(df)
         if df.empty:
             raise ValueError("ES data processing failed - insufficient data")
         
