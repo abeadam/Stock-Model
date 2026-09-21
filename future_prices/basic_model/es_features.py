@@ -148,15 +148,23 @@ def _mfi(
 def _parse_datetime_column(date_col: pd.Series) -> pd.Series:
     """Parse a date column to datetimes without the dateutil per-element fallback.
 
-    Handles the three formats this code sees: numeric Unix seconds (offline ES
-    files), and string timestamps from either the IB feed ("YYYYMMDD HH:MM:SS",
-    sometimes double-spaced) or pandas/ISO ("YYYY-MM-DD HH:MM:SS"). Passing an
-    explicit format / "mixed" avoids pandas' "Could not infer format" warning,
-    which is both noisy and slow in the live per-bar loop.
+    Handles the formats this code sees: Unix seconds as a number (offline ES
+    files) or as a string (the live IB feed under formatDate=2), and string
+    timestamps from either the IB feed ("YYYYMMDD HH:MM:SS", sometimes
+    double-spaced) or pandas/ISO ("YYYY-MM-DD HH:MM:SS"). Passing an explicit
+    format / "mixed" avoids pandas' "Could not infer format" warning, which is
+    both noisy and slow in the live per-bar loop.
     """
     if pd.api.types.is_numeric_dtype(date_col):
         return pd.to_datetime(date_col, unit="s", errors="coerce")
     cleaned = date_col.astype(str).str.strip().str.replace("  ", " ", regex=False)
+    # The TWS API hands epoch seconds back as a *string* under formatDate=2, so a
+    # column of all-digit strings is still Unix seconds and must not go down the
+    # date-string path — neither format below matches it, which would silently
+    # yield NaT and turn every time-of-day feature into NaN.
+    as_epoch = pd.to_numeric(cleaned, errors="coerce")
+    if as_epoch.notna().all():
+        return pd.to_datetime(as_epoch, unit="s", errors="coerce")
     parsed = pd.to_datetime(cleaned, format="%Y%m%d %H:%M:%S", errors="coerce")
     if parsed.isna().all():  # not the IB compact format — fall back to general parsing
         parsed = pd.to_datetime(cleaned, errors="coerce", format="mixed")
