@@ -1,6 +1,9 @@
 #!/bin/bash
 #
-# Weekly Stock-Model refresh — runs every Monday 08:00 via launchd.
+# Stock-Model refresh. With no argument it runs the whole pipeline below and
+# retrains (Monday mornings). With --download-only it runs steps 0 and 1 only:
+# com.abeadam.stockmodel.daily-download runs that every weekday after the
+# 17:00 ET futures close, so daily_data/ is never more than a session behind.
 #
 # Pipeline:
 #   0. Preflight: TWS/IB Gateway reachable on 127.0.0.1:7497
@@ -28,6 +31,13 @@
 #
 set -uo pipefail
 
+DOWNLOAD_ONLY=false
+case "${1:-}" in
+    "")              ;;
+    --download-only) DOWNLOAD_ONLY=true ;;
+    *)               echo "usage: $0 [--download-only]" >&2; exit 2 ;;
+esac
+
 # ---------------------------------------------------------------- configuration
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -51,7 +61,11 @@ BACKUP_DIR="$HERE/backups"
 LOCK_DIR="$HERE/.run.lock"
 BACKTEST_HISTORY="$REPORT_DIR/backtest_history.json"   # step 6b appends; step 7 gates on it
 THRESHOLDS_REFUSED_EXIT=3   # propose_thresholds.py exit code when a check refuses the new thresholds
-NOTIFICATION_TITLE="Stock-Model weekly update"
+if [ "$DOWNLOAD_ONLY" = true ]; then
+    NOTIFICATION_TITLE="Stock-Model daily download"
+else
+    NOTIFICATION_TITLE="Stock-Model weekly update"
+fi
 
 # What a retrain replaces: the models futures_trader.py loads, plus each LightGBM
 # model's importance CSV (the live feature contract, and the ranking the next
@@ -245,7 +259,7 @@ backup_models() {
 
 # ------------------------------------------------------------------- preflight
 log "============================================================="
-log "Weekly Stock-Model update — run $RUN_ID"
+log "$NOTIFICATION_TITLE — run $RUN_ID"
 log "============================================================="
 
 for path in "$IBKR_PY" "$MODEL_PY" "$TRADER_PY"; do
@@ -275,6 +289,15 @@ fi
 # futures_price.py reads straight out of daily_data/ (via the Stock-Model <->
 # interactive-broker-python symlink), so no separate consolidation step exists.
 run_step "1_download_daily_data" "$HERE" "$IBKR_PY" "$IBKR_ROOT/Updated Stats/download_daily.py"
+
+if [ "$DOWNLOAD_ONLY" = true ]; then
+    log "============================================================="
+    log "DOWNLOAD COMPLETE — the Monday run retrains on it"
+    log "Full log: $LOG"
+    log "============================================================="
+    cleanup
+    exit 0
+fi
 
 run_step "2_futures_price" "$FP_DIR" "$MODEL_PY" "$FP_DIR/futures_price.py"
 
