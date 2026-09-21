@@ -25,6 +25,16 @@ TARGET_SCALE = 50.0
 SCALING_METHOD = "asinh"
 OHLCV_COLS = ("Open", "High", "Low", "Close", "Volume")
 
+# The models were trained on US/Eastern wall-clock time (futures_price.py converts
+# every bar from UTC before deriving time features), so live features must use
+# the same clock. These anchors match futures_price.calculate_trading_hours.
+EASTERN_TIMEZONE = "America/New_York"
+FORMAL_TRADING_START_HOUR = 9.0
+OVERNIGHT_SESSION_START_HOUR = 18.0
+HOURS_PER_DAY = 24.0
+DAYS_PER_WEEK = 7.0
+MONTHS_PER_YEAR = 12.0
+
 
 def _path_importance_csv(model_kind: ModelKind) -> Path:
     if model_kind not in MODEL_KINDS:
@@ -145,8 +155,15 @@ def _mfi(
     return np.where(neg_sum == 0, 100.0, 100.0 - (100.0 / (1.0 + ratio)))
 
 
+def _epoch_to_eastern(epoch_seconds: pd.Series) -> pd.Series:
+    """Unix seconds (always UTC) as naive US/Eastern wall-clock datetimes."""
+    utc = pd.to_datetime(epoch_seconds, unit="s", utc=True, errors="coerce")
+    return utc.dt.tz_convert(EASTERN_TIMEZONE).dt.tz_localize(None)
+
+
 def _parse_datetime_column(date_col: pd.Series) -> pd.Series:
-    """Parse a date column to datetimes without the dateutil per-element fallback.
+    """Parse a date column to naive US/Eastern datetimes, without the dateutil
+    per-element fallback.
 
     Handles the formats this code sees: Unix seconds as a number (offline ES
     files) or as a string (the live IB feed under formatDate=2), and string
@@ -154,9 +171,12 @@ def _parse_datetime_column(date_col: pd.Series) -> pd.Series:
     double-spaced) or pandas/ISO ("YYYY-MM-DD HH:MM:SS"). Passing an explicit
     format / "mixed" avoids pandas' "Could not infer format" warning, which is
     both noisy and slow in the live per-bar loop.
+
+    Unix seconds are UTC and are converted to Eastern. Date strings carry no
+    zone and are taken to be Eastern already.
     """
     if pd.api.types.is_numeric_dtype(date_col):
-        return pd.to_datetime(date_col, unit="s", errors="coerce")
+        return _epoch_to_eastern(date_col)
     cleaned = date_col.astype(str).str.strip().str.replace("  ", " ", regex=False)
     # The TWS API hands epoch seconds back as a *string* under formatDate=2, so a
     # column of all-digit strings is still Unix seconds and must not go down the
@@ -164,7 +184,7 @@ def _parse_datetime_column(date_col: pd.Series) -> pd.Series:
     # yield NaT and turn every time-of-day feature into NaN.
     as_epoch = pd.to_numeric(cleaned, errors="coerce")
     if as_epoch.notna().all():
-        return pd.to_datetime(as_epoch, unit="s", errors="coerce")
+        return _epoch_to_eastern(as_epoch)
     parsed = pd.to_datetime(cleaned, format="%Y%m%d %H:%M:%S", errors="coerce")
     if parsed.isna().all():  # not the IB compact format — fall back to general parsing
         parsed = pd.to_datetime(cleaned, errors="coerce", format="mixed")
@@ -173,28 +193,30 @@ def _parse_datetime_column(date_col: pd.Series) -> pd.Series:
 
 def _time_features(date_col: pd.Series, n: int) -> dict[str, np.ndarray]:
     """
-    Compute time-of-day and calendar features from a date column.
-    Timestamps are assumed to be in ET (or naive ET) — no tz conversion is applied.
-    Falls back to NaN arrays on any parse error.
+    Compute time-of-day and calendar features from a date column, in US/Eastern.
+
+    Each definition mirrors futures_price.py, which built the training data:
+    hour_sin/hour_cos use the whole hour, while the two Hours_From_* features are
+    exact to the second. Falls back to NaN arrays on any parse error.
     """
     try:
-        dt        = _parse_datetime_column(date_col)
-        hour      = dt.dt.hour.values.astype(np.float64)
-        minute    = dt.dt.minute.values.astype(np.float64)
-        hour_frac = hour + minute / 60.0
-        # Formal trading starts at 09:00 ET
-        hours_formal    = hour_frac - 9.0
-        # Overnight session starts at 18:00 ET; before 18:00 use previous day's 18:00
-        hours_overnight = np.where(hour_frac >= 18.0, hour_frac - 18.0, hour_frac + 6.0)
+        dt          = _parse_datetime_column(date_col)
+        whole_hour  = dt.dt.hour.values.astype(np.float64)
+        exact_hours = (whole_hour
+                       + dt.dt.minute.values / 60.0
+                       + dt.dt.second.values / 3600.0)
+        hours_formal = exact_hours - FORMAL_TRADING_START_HOUR
+        # Hours since the most recent 18:00 ET, i.e. since the Globex session opened.
+        hours_overnight = np.mod(exact_hours - OVERNIGHT_SESSION_START_HOUR, HOURS_PER_DAY)
         return {
             "Hours_From_Formal_Trading":    hours_formal,
             "Hours_From_Overnight_Trading": hours_overnight,
-            "hour_sin":  np.sin(2 * np.pi * hour_frac / 24),
-            "hour_cos":  np.cos(2 * np.pi * hour_frac / 24),
-            "day_sin":   np.sin(2 * np.pi * dt.dt.dayofweek.values / 7),
-            "day_cos":   np.cos(2 * np.pi * dt.dt.dayofweek.values / 7),
-            "month_sin": np.sin(2 * np.pi * dt.dt.month.values / 12),
-            "month_cos": np.cos(2 * np.pi * dt.dt.month.values / 12),
+            "hour_sin":  np.sin(2 * np.pi * whole_hour / HOURS_PER_DAY),
+            "hour_cos":  np.cos(2 * np.pi * whole_hour / HOURS_PER_DAY),
+            "day_sin":   np.sin(2 * np.pi * dt.dt.dayofweek.values / DAYS_PER_WEEK),
+            "day_cos":   np.cos(2 * np.pi * dt.dt.dayofweek.values / DAYS_PER_WEEK),
+            "month_sin": np.sin(2 * np.pi * dt.dt.month.values / MONTHS_PER_YEAR),
+            "month_cos": np.cos(2 * np.pi * dt.dt.month.values / MONTHS_PER_YEAR),
         }
     except Exception:
         nan_arr = np.full(n, np.nan, dtype=np.float64)
