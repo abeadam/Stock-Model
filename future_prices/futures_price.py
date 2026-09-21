@@ -65,6 +65,15 @@ def load_es_data(data_dir: str = 'daily_data') -> pd.DataFrame:
     # Concatenate all data
     combined_df = pd.concat(all_data, ignore_index=True)
     combined_df = combined_df.sort_values('Date').reset_index(drop=True)
+    # One bar can appear in two day files: a session that spans midnight lands in
+    # whichever day file the writer bucketed it into, and re-downloads overlap at
+    # session edges. The values agree, but leaving the repeat in would let every
+    # rolling indicator below count that bar twice. The merge step deduplicates
+    # too, and by then the indicators are already computed.
+    before_dedup = len(combined_df)
+    combined_df = combined_df.drop_duplicates(subset='Date', keep='last').reset_index(drop=True)
+    if len(combined_df) != before_dedup:
+        print(f"  Dropped {before_dedup - len(combined_df)} duplicate-timestamp row(s)")
     
     print(f"Loaded {len(combined_df)} total rows from {len(all_data)} files")
     
@@ -117,6 +126,15 @@ def load_vxm_data(data_dir: str = 'daily_data') -> pd.DataFrame:
     # Concatenate all data
     combined_df = pd.concat(all_data, ignore_index=True)
     combined_df = combined_df.sort_values('Date').reset_index(drop=True)
+    # One bar can appear in two day files: a session that spans midnight lands in
+    # whichever day file the writer bucketed it into, and re-downloads overlap at
+    # session edges. The values agree, but leaving the repeat in would let every
+    # rolling indicator below count that bar twice. The merge step deduplicates
+    # too, and by then the indicators are already computed.
+    before_dedup = len(combined_df)
+    combined_df = combined_df.drop_duplicates(subset='Date', keep='last').reset_index(drop=True)
+    if len(combined_df) != before_dedup:
+        print(f"  Dropped {before_dedup - len(combined_df)} duplicate-timestamp row(s)")
     
     print(f"Loaded {len(combined_df)} total rows from {len(all_data)} files")
     
@@ -171,6 +189,15 @@ def load_stock_data(ticker: str, data_dir: str = 'daily_data') -> pd.DataFrame:
     # Concatenate all data
     combined_df = pd.concat(all_data, ignore_index=True)
     combined_df = combined_df.sort_values('Date').reset_index(drop=True)
+    # One bar can appear in two day files: a session that spans midnight lands in
+    # whichever day file the writer bucketed it into, and re-downloads overlap at
+    # session edges. The values agree, but leaving the repeat in would let every
+    # rolling indicator below count that bar twice. The merge step deduplicates
+    # too, and by then the indicators are already computed.
+    before_dedup = len(combined_df)
+    combined_df = combined_df.drop_duplicates(subset='Date', keep='last').reset_index(drop=True)
+    if len(combined_df) != before_dedup:
+        print(f"  Dropped {before_dedup - len(combined_df)} duplicate-timestamp row(s)")
     
     print(f"Loaded {len(combined_df)} total rows from {len(all_data)} {ticker} files")
     
