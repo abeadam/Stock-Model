@@ -98,7 +98,8 @@ def load_data(csv_path, sample_size=None, chunk_size=100000):
     return df
 
 
-def prepare_features_and_target(df, target_column='PctChange_CloseToHigh'):
+def prepare_features_and_target(df, target_column='PctChange_CloseToHigh', *,
+                                return_valid_mask=False):
     """
     Prepare features and target variable.
 
@@ -116,6 +117,10 @@ def prepare_features_and_target(df, target_column='PctChange_CloseToHigh'):
         TARGET_SCALE: Scale factor used for target
         SCALING_METHOD: Method used for scaling
         y_original: Original unscaled target (for correlation analysis)
+        valid_mask: (only when return_valid_mask=True) boolean array over df's
+            rows, True for each row kept in X. Rows with a NaN target or feature
+            are dropped wherever they fall, including mid-dataset, so callers
+            mapping predictions back onto df must use this, not row counts.
     """
     print("\nPreparing features and target...")
 
@@ -543,6 +548,8 @@ def prepare_features_and_target(df, target_column='PctChange_CloseToHigh'):
     print(f"Number of features: {len(feature_cols)}")
     print(f"Features: {feature_cols}")
 
+    if return_valid_mask:
+        return X, y, feature_cols, TARGET_SCALE, SCALING_METHOD, y_original, valid_mask
     return X, y, feature_cols, TARGET_SCALE, SCALING_METHOD, y_original
 
 

@@ -56,7 +56,6 @@ from lightgbm_utils import (  # noqa: E402
 
 # ── Constants ──────────────────────────────────────────────────────────────
 _ASINH_SCALE = 50.0   # matches ASINH_SCALE used during training
-N_FUTURE     = 5      # look-ahead bars (last N rows have NaN targets in CSV)
 
 
 # ── Inference ──────────────────────────────────────────────────────────────
@@ -79,20 +78,12 @@ def run_inference(
     target values are ignored at inference time).
 
     Returns float array of length len(df) with NaN for rows where any feature
-    is missing (rolling-window warmup rows and the last N_FUTURE rows).
+    or the target is missing.
     """
     # Build full feature matrix — same pipeline as training
-    X, _y, feature_cols, _scale, _method, _ = prepare_features_and_target(
-        df, target_column=target_col
+    X, _y, feature_cols, _scale, _method, _, kept_rows = prepare_features_and_target(
+        df, target_column=target_col, return_valid_mask=True
     )
-    # prepare_features_and_target drops NaN rows from both ends:
-    #   start: feature warmup (rolling windows up to 50 bars)
-    #   end:   last N_FUTURE rows (NaN target)
-    # Reconstruct the slice of original df that was kept.
-    n_nan_end   = N_FUTURE
-    n_nan_start = len(df) - len(X) - n_nan_end
-    if n_nan_start < 0:
-        n_nan_start = 0  # guard for very short dataframes
 
     model = joblib.load(model_path)
 
@@ -110,8 +101,13 @@ def run_inference(
     y_scaled = model.predict(X)
     y_pred   = np.sign(y_scaled) * np.sinh(np.abs(y_scaled)) / _ASINH_SCALE
 
+    # Scatter back onto exactly the rows kept. Counting in from the ends assumed
+    # five NaN-target rows at the tail, but futures_price.py already trims them,
+    # so every prediction landed five bars early: bar i carried the prediction
+    # made from bar i+5, the window the gradient target measures. A NaN
+    # mid-dataset would have shifted every later row further still.
     result = np.full(len(df), np.nan)
-    result[n_nan_start : n_nan_start + len(X)] = y_pred
+    result[kept_rows] = y_pred
     return result
 
 
