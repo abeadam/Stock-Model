@@ -53,14 +53,6 @@ PRIOR_SESSIONS_FOR_RANGE = 20
 EFFICIENCY_SAMPLING = "1min"
 PERCENT = 100.0
 
-# ES trades 16:00-16:59 ET, after the stock close, but daily_data files older
-# than IBKR's 5-second retention lack that hour. Prior-session ranges leave it
-# out everywhere, so old and new sessions are measured alike. The hour set a new
-# session high or low in 18% of sessions and moved a 20-session average range by
-# a median 0.74% (measured on 74 sessions, June-September 2026).
-PRIOR_RANGE_EXCLUDES_LAST_FUTURES_HOUR = True
-LAST_FUTURES_HOUR = 16
-
 _SESSION_START_OFFSET = pd.Timedelta(hours=OVERNIGHT_SESSION_START_HOUR)
 
 
@@ -72,17 +64,15 @@ def session_start_times(eastern_times: pd.Series) -> pd.Series:
 def session_ranges(eastern_times: pd.Series, high: pd.Series, low: pd.Series) -> pd.Series:
     """The high-low range of every session observed from its open, indexed by its start.
 
-    This is the history other sessions look back on. Inputs must share one index.
+    This is the history other sessions look back on. It spans the whole session,
+    including 16:00-16:59 ET, which the daily_data files hold for ES from
+    2025-06-23 on; only the first few weeks of data lack it. Inputs must share
+    one index.
     """
     session = session_start_times(eastern_times)
     first_bar = eastern_times.groupby(session).min()
     observed = first_bar.index[(first_bar - first_bar.index) <= SESSION_START_TOLERANCE]
-
-    counted = pd.Series(True, index=eastern_times.index)
-    if PRIOR_RANGE_EXCLUDES_LAST_FUTURES_HOUR:
-        counted = eastern_times.dt.hour != LAST_FUTURES_HOUR
-    ranges = (high[counted].groupby(session[counted]).max()
-              - low[counted].groupby(session[counted]).min())
+    ranges = high.groupby(session).max() - low.groupby(session).min()
     return ranges.reindex(observed).dropna().sort_index().rename("range")
 
 

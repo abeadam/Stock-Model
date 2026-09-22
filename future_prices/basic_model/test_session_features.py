@@ -142,12 +142,12 @@ class PriorRangeTest(unittest.TestCase):
         self.assertEqual(list(ranges.index), [pd.Timestamp("2025-06-02 18:00")])
         self.assertEqual(ranges.iloc[0], 20.0)
 
-    def test_the_hour_after_the_stock_close_is_left_out_of_ranges(self):
+    def test_ranges_include_the_hour_after_the_stock_close(self):
         session = bars(epoch_at_eastern(2025, 6, 2, 18), [(100, 101, 99, 100, 1)] * 3)
         last_hour = bars(epoch_at_eastern(2025, 6, 3, 16, 30), [(100, 130, 70, 100, 1)])
         frame = pd.concat([session, last_hour], ignore_index=True)
         ranges = session_ranges(eastern_times(frame), frame["High"], frame["Low"])
-        self.assertEqual(ranges.iloc[0], 2.0)
+        self.assertEqual(ranges.iloc[0], 60.0)
 
 
 class NoLookaheadTest(unittest.TestCase):
