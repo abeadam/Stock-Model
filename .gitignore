@@ -39,3 +39,7 @@ future_prices/gradient_value/model_input.csv
 # Tool state (Claude Code worktrees, Serena cache)
 .claude/
 .serena/
+
+# Research harness caches and fetched data
+research/**/__pycache__/
+research/**/*_cache/
