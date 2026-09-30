@@ -1,0 +1,9 @@
+   0 of 6 droppable columns present in this base -- the drop is untestable here
+   SKIPPING 'dropped only': its columns are identical to 'shared', so it can only restate that arm's numbers
+no_spy: 1,457,460 bars, 315 sessions, 13 folds, delay 1, horizon 18 (33s to build)
+   shared        (dir 91, vol 91)  direction 0.5058  volatility R2 0.4820   (2711s)
+   split         (dir 91, vol 93)  direction 0.5058  volatility R2 0.5011   (5183s)
+  per-fold results saved to /Users/abeadam/dev/model/Stock-Model/scratchpad_backup/head_split_test_no_spy.json
+  arm             direction      t    agree  volatility      t    agree    gain
+  shared             0.5058                      0.4820
+  split            +0.00000    0.0     0/13    +0.01913    6.6    12/13   81.6%
