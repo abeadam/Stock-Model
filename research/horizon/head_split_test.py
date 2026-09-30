@@ -79,6 +79,24 @@ def arms_for(base: list[str]) -> dict[str, HeadColumns]:
     }
 
 
+def vacuous_arms(arms: dict[str, HeadColumns]) -> dict[str, str]:
+    """Arms whose columns match an earlier arm exactly, so they can only restate it.
+
+    This cost 45 minutes once. The long-history base holds none of the six oil and
+    dollar columns -- the mid-microstructure family does not reach back that far -- so
+    "dropped only" was identical to "shared" and produced identical numbers, which is
+    easy to misread as evidence that the drop is harmless rather than absent.
+    """
+    seen, vacuous = {}, {}
+    for name, columns in arms.items():
+        signature = (tuple(columns.direction), tuple(columns.volatility))
+        if signature in seen:
+            vacuous[name] = seen[signature]
+        else:
+            seen[signature] = name
+    return vacuous
+
+
 def main(include_spy: bool, horizon: int) -> None:
     started = time.time()
     tag = "with_spy" if include_spy else "no_spy"
@@ -90,7 +108,16 @@ def main(include_spy: bool, horizon: int) -> None:
         data[name] = realized_volatility(close, session_days, window)
 
     folds = monthly_folds(session_days, horizon)
-    arms = arms_for(base_columns(include_spy))
+    base = base_columns(include_spy)
+    arms = arms_for(base)
+    present = [name for name in DROPPED_FEATURES if name in base]
+    print(f"   {len(present)} of {len(DROPPED_FEATURES)} droppable columns present in this base"
+          f"{': ' + ', '.join(present) if present else ' -- the drop is untestable here'}",
+          flush=True)
+    for name, same_as in vacuous_arms(arms).items():
+        print(f"   SKIPPING {name!r}: its columns are identical to {same_as!r}, so it can "
+              f"only restate that arm's numbers", flush=True)
+        del arms[name]
     direction = forward_average_target(close, seconds, horizon, DELAY_BARS)
     decided = np.isfinite(direction) & (direction != 0)
     ranges = forward_range_target(data["High"].to_numpy(float), data["Low"].to_numpy(float),

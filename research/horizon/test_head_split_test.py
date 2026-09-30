@@ -100,3 +100,36 @@ def test_gain_share_is_zero_when_nothing_was_added():
 
 def test_gain_share_survives_a_model_that_used_nothing():
     assert gain_share(FakeModel([0.0, 0.0]), added=1) == 0.0
+
+
+def test_an_identical_arm_is_reported_as_vacuous():
+    from head_split_test import vacuous_arms
+    arms = arms_for(["ema_9", "rolling_vol_5"])        # no droppable columns present
+    assert vacuous_arms(arms) == {"dropped only": "shared"}
+
+
+def test_nothing_is_vacuous_when_every_arm_differs():
+    from head_split_test import vacuous_arms
+    assert vacuous_arms(arms_for(BASE)) == {}
+
+
+def test_the_split_arm_is_never_vacuous_because_it_adds_columns():
+    from head_split_test import vacuous_arms
+    assert "split" not in vacuous_arms(arms_for(["ema_9"]))
+
+
+def test_the_long_history_base_holds_none_of_the_droppable_columns():
+    """The reason the drop cannot be verified on this harness, asserted against reality.
+
+    The six oil and dollar columns are mid-microstructure, and that family does not
+    reach back over the long history. Verifying the drop needs the short-history set.
+    """
+    from long_history_support import base_columns
+    assert not set(DROPPED_FEATURES) & set(base_columns(include_spy=False))
+    assert not set(DROPPED_FEATURES) & set(base_columns(include_spy=True))
+
+
+def test_the_droppable_columns_exist_somewhere_though():
+    """If they vanished entirely the drop would be meaningless rather than untested."""
+    from mid_microstructure import MID_FEATURES
+    assert set(DROPPED_FEATURES) <= set(MID_FEATURES)
