@@ -32,6 +32,7 @@ import talib
 
 from cross_asset_features import BASKET_SYMBOLS, CROSS_ASSET_FEATURES
 from deep_ladder_features import session_row_blocks
+from realized_volatility_features import realized_volatility
 from flow_features import FLOW_FEATURES
 from short_horizon_walk_forward import FEATURES, FoldSplit, load as load_model_input
 from volume_scaled_target import regular_hours
@@ -83,17 +84,6 @@ def usable_sessions(include_spy: bool) -> set[str]:
         found = sessions_with(symbol)
         available = found if available is None else available & found
     return available or set()
-
-
-def realized_volatility(close: np.ndarray, session_days: np.ndarray, window: int) -> np.ndarray:
-    """Standard deviation of one-bar percent moves, rebuilt inside each session."""
-    returns = pd.Series(close).pct_change()
-    result = np.full(len(close), np.nan)
-    for rows in session_row_blocks(session_days):
-        block = returns.iloc[rows].reset_index(drop=True)
-        block.iloc[0] = np.nan
-        result[rows] = block.rolling(window, min_periods=window // 2).std().to_numpy()
-    return result
 
 
 def add_long_history_features(data: pd.DataFrame) -> pd.DataFrame:

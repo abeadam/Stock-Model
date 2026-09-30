@@ -33,6 +33,7 @@ import numpy as np
 import pandas as pd
 
 from deep_ladder_features import session_row_blocks
+from realized_volatility_features import realized_volatility
 
 BAR_SECONDS = 5
 PERCENT = 100.0
@@ -57,17 +58,8 @@ def implied_per_bar_move(vix_level: np.ndarray) -> np.ndarray:
 
 
 def realized_per_bar_move(mid: np.ndarray, session_days: np.ndarray, window: int) -> np.ndarray:
-    """Standard deviation of one-bar fractional mid moves, measured inside each session.
-
-    The window is rebuilt per session rather than blanking the overnight return alone: a
-    rolling window that merely skips the gap still reaches back into yesterday's tape."""
-    returns = pd.Series(mid).pct_change()
-    result = np.full(len(mid), np.nan)
-    for rows in session_row_blocks(session_days):
-        block = returns.iloc[rows].reset_index(drop=True)
-        block.iloc[0] = np.nan                      # the overnight jump is not a bar move
-        result[rows] = block.rolling(window, min_periods=window // 2).std().to_numpy()
-    return result
+    """Standard deviation of one-bar fractional mid moves, measured inside each session."""
+    return realized_volatility(mid, session_days, window)
 
 
 def position_in_session(session_days: np.ndarray) -> np.ndarray:
