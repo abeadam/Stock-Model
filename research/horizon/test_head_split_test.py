@@ -133,3 +133,60 @@ def test_the_droppable_columns_exist_somewhere_though():
     """If they vanished entirely the drop would be meaningless rather than untested."""
     from mid_microstructure import MID_FEATURES
     assert set(DROPPED_FEATURES) <= set(MID_FEATURES)
+
+
+def synthetic(shared_r2, split_r2, folds=3):
+    """Per-fold tables shaped like a real run, with one seed per fold."""
+    months = [f"2026-0{index + 1}" for index in range(folds)]
+    auc = {name: {month: [0.51] for month in months} for name in ("shared", "split")}
+    r2 = {"shared": {month: [shared_r2] for month in months},
+          "split": {month: [split_r2] for month in months}}
+    return auc, r2, {"shared": [0.0], "split": [0.05]}, months
+
+
+class Fold:
+    def __init__(self, month):
+        self.month = month
+
+
+def test_report_formats_a_real_shaped_result(capsys):
+    """paired_t returns (mean, t); formatting the tuple raised TypeError after a 2h run."""
+    from head_split_test import report
+    auc, r2, gain, months = synthetic(0.48, 0.50)
+    report(auc, r2, gain, {"shared": None, "split": None}, [Fold(m) for m in months])
+    out = capsys.readouterr().out
+    assert "split" in out and "+0.02000" in out
+
+
+def test_report_survives_an_arm_identical_to_shared(capsys):
+    """A zero-variance difference must not divide by zero."""
+    from head_split_test import report
+    auc, r2, gain, months = synthetic(0.48, 0.48)
+    report(auc, r2, gain, {"shared": None, "split": None}, [Fold(m) for m in months])
+    assert "+0.00000" in capsys.readouterr().out
+
+
+def test_report_counts_the_folds_that_agree(capsys):
+    from head_split_test import report
+    auc, r2, gain, months = synthetic(0.48, 0.50)
+    report(auc, r2, gain, {"shared": None, "split": None}, [Fold(m) for m in months])
+    assert "3/3" in capsys.readouterr().out
+
+
+def test_results_are_saved_before_they_are_formatted(tmp_path, monkeypatch):
+    """The ordering that turns a formatting bug from lost work into a stack trace."""
+    import head_split_test as module
+    monkeypatch.setattr(module, "RESULTS_PATH", str(tmp_path / "out_{tag}.json"))
+    auc, r2, gain, _ = synthetic(0.48, 0.50)
+    module.save(auc, r2, gain, horizon=18, tag="unit")
+    assert (tmp_path / "out_unit.json").exists()
+
+
+def test_the_saved_file_carries_every_fold(tmp_path, monkeypatch):
+    import json
+    import head_split_test as module
+    monkeypatch.setattr(module, "RESULTS_PATH", str(tmp_path / "out_{tag}.json"))
+    auc, r2, gain, months = synthetic(0.48, 0.50, folds=5)
+    module.save(auc, r2, gain, horizon=18, tag="unit")
+    saved = json.loads((tmp_path / "out_unit.json").read_text())
+    assert list(saved["r2"]["split"]) == months

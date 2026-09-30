@@ -141,28 +141,41 @@ def main(include_spy: bool, horizon: int) -> None:
               f"volatility R2 {np.mean([np.mean(v) for v in r2[name].values()]):.4f}   "
               f"({time.time() - started:.0f}s)", flush=True)
         del matrix
+
+    # Save before formatting. A TypeError in report() once destroyed 2h10m of per-fold
+    # results that were already computed and sitting in memory.
+    save(auc, r2, gain, horizon, tag)
     report(auc, r2, gain, arms, folds)
-    with open(RESULTS_PATH.format(tag=tag), "w") as handle:
+
+
+def save(auc, r2, gain, horizon: int, tag: str) -> None:
+    path = RESULTS_PATH.format(tag=tag)
+    with open(path, "w") as handle:
         json.dump({"auc": {k: {m: list(v) for m, v in d.items()} for k, d in auc.items()},
                    "r2": {k: {m: list(v) for m, v in d.items()} for k, d in r2.items()},
                    "gain": gain, "horizon": horizon, "delay": DELAY_BARS}, handle, indent=1)
+    print(f"\n  per-fold results saved to {path}", flush=True)
 
 
 def report(auc, r2, gain, arms, folds) -> None:
+    """Each arm against `shared` on the same folds, so the fold purge cancels."""
     months = [fold.month for fold in folds]
-    print(f"\n  {'arm':<14}{'direction':>11}{'t':>7}{'agree':>10}"
-          f"{'volatility':>12}{'t':>7}{'agree':>10}{'gain':>8}")
+    fold_mean = lambda table, name: np.array([np.mean(table[name][month]) for month in months])
+    print(f"\n  {'arm':<14}{'direction':>11}{'t':>7}{'agree':>9}"
+          f"{'volatility':>12}{'t':>7}{'agree':>9}{'gain':>8}")
+    print(f"  {'shared':<14}{fold_mean(auc, 'shared').mean():>11.4f}{'':>7}{'':>9}"
+          f"{fold_mean(r2, 'shared').mean():>12.4f}")
     for name in arms:
         if name == "shared":
-            print(f"  {name:<14}{np.mean([np.mean(auc[name][m]) for m in months]):>11.4f}"
-                  f"{'':>7}{'':>10}{np.mean([np.mean(r2[name][m]) for m in months]):>12.4f}")
             continue
-        direction_diff = np.array([np.mean(auc[name][m]) - np.mean(auc["shared"][m]) for m in months])
-        volatility_diff = np.array([np.mean(r2[name][m]) - np.mean(r2["shared"][m]) for m in months])
-        print(f"  {name:<14}{direction_diff.mean():>+11.5f}{paired_t(direction_diff):>7.1f}"
-              f"{f'{int((direction_diff > 0).sum())}/{len(months)}':>10}"
-              f"{volatility_diff.mean():>+12.5f}{paired_t(volatility_diff):>7.1f}"
-              f"{f'{int((volatility_diff > 0).sum())}/{len(months)}':>10}"
+        direction_diff = fold_mean(auc, name) - fold_mean(auc, "shared")
+        volatility_diff = fold_mean(r2, name) - fold_mean(r2, "shared")
+        direction_gain, direction_t = paired_t(direction_diff)
+        volatility_gain, volatility_t = paired_t(volatility_diff)
+        print(f"  {name:<14}{direction_gain:>+11.5f}{direction_t:>7.1f}"
+              f"{f'{int((direction_diff > 0).sum())}/{len(months)}':>9}"
+              f"{volatility_gain:>+12.5f}{volatility_t:>7.1f}"
+              f"{f'{int((volatility_diff > 0).sum())}/{len(months)}':>9}"
               f"{np.mean(gain[name]):>8.1%}")
 
 
