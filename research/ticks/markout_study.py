@@ -30,8 +30,11 @@ from markout import (BUY, MARKOUT_HORIZONS, POINT_VALUE, SELL, attempt, drift_do
 from passive_fill import Book
 from tick_probe import TICKS_DIR, load_day
 
+# Every session rebuilt at full granularity: 1.28M-2.58M quote ticks each at 100%
+# second coverage. 09-16 and 09-17 are excluded permanently -- their contract expired,
+# so IBKR serves only sparse trades for them and no refetch can complete them.
 CLEAN_SESSIONS = ("2026-09-18", "2026-09-21", "2026-09-22", "2026-09-23",
-                  "2026-09-24", "2026-09-25", "2026-09-28", "2026-09-29")
+                  "2026-09-24", "2026-09-25", "2026-09-28", "2026-09-29", "2026-09-30")
 DECISIONS_PER_SIDE = 3000
 ENTRY_LIMIT_SECONDS = 30.0
 SEED = 11

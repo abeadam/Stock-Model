@@ -1,0 +1,19 @@
+2026-09-30: 26,172 fills, 23.3% toxic (83s to build)
+
+ split   train    test      L1   snapshot  subsecond   OFI best  OFI multi    OFI all
+   40%  10,470  15,596  0.5972     0.5848     0.5939     0.5991     0.5977     0.5938   (113s)
+   50%  13,088  12,984  0.6151     0.5953     0.6123     0.6165     0.6110     0.6020   (145s)
+   60%  15,704  10,359  0.5943     0.5969     0.5979     0.6032     0.6029     0.6002   (177s)
+   70%  18,321   7,758  0.5936     0.6003     0.5954     0.6031     0.6013     0.5933   (212s)
+   80%  20,939   5,134  0.5893     0.5955     0.5944     0.5988     0.5967     0.5859   (246s)
+
+  baseline L1 across splits: 0.5979 (the 13%-sample run gave 0.5942; walk-forward records 0.6767)
+
+  family            lift   splits up
+  snapshot       -0.0034         3/5
+  subsecond      +0.0009         3/5
+  OFI best       +0.0062         5/5
+  OFI multi      +0.0040         4/5
+  OFI all        -0.0029         1/5
+
+  saved to /Users/abeadam/dev/model/Stock-Model/scratchpad_backup/depth_probe_full.json
