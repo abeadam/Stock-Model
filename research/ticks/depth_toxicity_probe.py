@@ -28,6 +28,8 @@ import pandas as pd
 from sklearn.metrics import roc_auc_score
 
 from depth_features import DEPTH_FEATURE_NAMES, at_placement_depth, book_frame, load_depth
+from ofi_features import (BEST_LEVEL_OFI_NAMES, MULTI_LEVEL_OFI_NAMES, OFI_FEATURE_NAMES,
+                          at_placement_ofi, window_ofi)
 from subsecond_depth_features import (SUBSECOND_FEATURE_NAMES, at_placement_subsecond, replay,
                                       subsecond_frame)
 from toxicity_model import (ENTRY_LIMIT_SECONDS, HOLD_SECONDS, LGBM_PARAMS, fill_with_reason)
@@ -53,6 +55,7 @@ def fills_with_depth(day: str, decisions_per_side: int, seed: int) -> pd.DataFra
     covered = set(shaped.index.astype(int))
     pool = np.array(sorted(fresh & covered))
     fine = subsecond_frame(replay(day), pool)
+    flows = window_ofi(day, pool)
     generator = np.random.default_rng(seed)
     rows = []
     for side in (BUY, SELL):
@@ -64,10 +67,11 @@ def fills_with_depth(day: str, decisions_per_side: int, seed: int) -> pd.DataFra
             features = at_placement(frame, int(place), side)
             depth = at_placement_depth(shaped, int(place), side)
             fast = at_placement_subsecond(fine, int(place), side)
-            if features is None or depth is None or fast is None:
+            flow = at_placement_ofi(flows, int(place), side)
+            if features is None or depth is None or fast is None or flow is None:
                 continue
             if not all(np.isfinite(list(features.values()) + list(depth.values())
-                                   + list(fast.values()))):
+                                   + list(fast.values()) + list(flow.values()))):
                 continue
             got = fill_with_reason(book, float(place), price, side, ahead, ENTRY_LIMIT_SECONDS)
             if got is None:
@@ -82,7 +86,7 @@ def fills_with_depth(day: str, decisions_per_side: int, seed: int) -> pd.DataFra
             rows.append({"placed": int(place), "side": side,
                          "toxic": int(reason == "through"),
                          "total": side * (mid_later - price) * POINT_VALUE,
-                         **features, **depth, **fast})
+                         **features, **depth, **fast, **flow})
     return pd.DataFrame(rows).sort_values("placed", kind="stable").reset_index(drop=True)
 
 
@@ -106,13 +110,16 @@ def main(decisions_per_side: int = DECISIONS_PER_SIDE) -> None:
     fills = fills_with_depth(SESSION, decisions_per_side, SEED)
     reserved = ("placed", "side", "toxic", "total")
     l1 = [name for name in fills.columns if name not in reserved
-          and not name.startswith("depth_") and not name.startswith("ss_")]
+          and not name.startswith("depth_") and not name.startswith("ss_")
+          and not name.startswith("ofi_")]
     arms = {"L1": l1,
             "L1+snapshot": l1 + DEPTH_FEATURE_NAMES,
             "L1+subsecond": l1 + SUBSECOND_FEATURE_NAMES,
-            "L1+both": l1 + DEPTH_FEATURE_NAMES + SUBSECOND_FEATURE_NAMES,
-            "snapshot only": DEPTH_FEATURE_NAMES,
-            "subsecond only": SUBSECOND_FEATURE_NAMES}
+            "L1+OFI best": l1 + BEST_LEVEL_OFI_NAMES,
+            "L1+OFI multi": l1 + MULTI_LEVEL_OFI_NAMES,
+            "L1+OFI all": l1 + OFI_FEATURE_NAMES,
+            "OFI only": MULTI_LEVEL_OFI_NAMES,
+            "snapshot only": DEPTH_FEATURE_NAMES}
     train, test = time_split(fills)
     print(f"{SESSION}: {len(fills):,} fills, {fills['toxic'].mean():.1%} toxic")
     print(f"  train {len(train):,} fills, test {len(test):,}, purge {PURGE_SECONDS}s\n")
@@ -123,7 +130,7 @@ def main(decisions_per_side: int = DECISIONS_PER_SIDE) -> None:
         scores[name] = values
         print(f"  {name:<12}{len(columns):>9}{values.mean():>9.4f}{values.std(ddof=1):>8.4f}")
     print()
-    for name in ("L1+snapshot", "L1+subsecond", "L1+both"):
+    for name in ("L1+snapshot", "L1+subsecond", "L1+OFI best", "L1+OFI multi", "L1+OFI all"):
         lift = scores[name] - scores["L1"]
         print(f"  {name:<14} adds {lift.mean():+.4f} AUC over L1 "
               f"({int((lift > 0).sum())}/{len(lift)} seeds up)")
