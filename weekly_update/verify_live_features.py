@@ -66,12 +66,26 @@ def fail(message: str, code: int = 2) -> None:
     sys.exit(code)
 
 
+def probe_bar_times(n: int) -> list[str]:
+    """n 5-second bar times from today's 18:00 ET open, as epoch-second strings."""
+    from market_clock import EASTERN_TIMEZONE, OVERNIGHT_SESSION_START_HOUR
+    session_open = (pd.Timestamp.now(tz=EASTERN_TIMEZONE).normalize()
+                    + pd.Timedelta(hours=OVERNIGHT_SESSION_START_HOUR))
+    times = pd.date_range(session_open, periods=n, freq="5s")
+    return [str(int(time.timestamp())) for time in times]
+
+
 def build_probe_bars(n: int = PROBE_BARS) -> pd.DataFrame:
     """A live-shaped bar window: exactly the columns futures_trader.py supplies.
 
     Values are synthetic but well-formed (strictly positive prices, non-zero
     volume, monotonic 5-second timestamps) so that a NaN in the final row means
     the feature genuinely cannot be computed, not that the probe was degenerate.
+
+    The bars start at today's 18:00 ET session open and carry epoch-second
+    strings, as TWS sends them. Session features need a session observed from
+    its open and the prior sessions in daily_data before it, exactly as the
+    live trader's current session has. Call after basic_model is on sys.path.
     """
     rng = np.random.default_rng(0)
     close = 100.0 + np.cumsum(rng.normal(0.0, 0.1, n))
@@ -87,7 +101,7 @@ def build_probe_bars(n: int = PROBE_BARS) -> pd.DataFrame:
         "VXM_Low": vxm_close - 0.2,
         "VXM_Close": vxm_close,
         "VXM_Volume": rng.random(n) * 100.0 + 1.0,
-        "date": pd.date_range("2026-01-05 09:30:00", periods=n, freq="5s"),
+        "date": probe_bar_times(n),
     })
 
 

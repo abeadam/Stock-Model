@@ -16,6 +16,14 @@ import numpy as np
 import pandas as pd
 
 from lightgbm_utils import unscale_target
+from market_clock import (
+    FORMAL_TRADING_START_HOUR,
+    HOURS_PER_DAY,
+    OVERNIGHT_SESSION_START_HOUR,
+    parse_to_eastern,
+)
+from session_features import session_features_for_bars
+from session_history import prior_session_ranges
 
 ModelKind = Literal["highest", "lowest"]
 MODEL_KINDS: tuple[ModelKind, ...] = ("highest", "lowest")
@@ -25,13 +33,6 @@ TARGET_SCALE = 50.0
 SCALING_METHOD = "asinh"
 OHLCV_COLS = ("Open", "High", "Low", "Close", "Volume")
 
-# The models were trained on US/Eastern wall-clock time (futures_price.py converts
-# every bar from UTC before deriving time features), so live features must use
-# the same clock. These anchors match futures_price.calculate_trading_hours.
-EASTERN_TIMEZONE = "America/New_York"
-FORMAL_TRADING_START_HOUR = 9.0
-OVERNIGHT_SESSION_START_HOUR = 18.0
-HOURS_PER_DAY = 24.0
 DAYS_PER_WEEK = 7.0
 MONTHS_PER_YEAR = 12.0
 
@@ -155,52 +156,15 @@ def _mfi(
     return np.where(neg_sum == 0, 100.0, 100.0 - (100.0 / (1.0 + ratio)))
 
 
-def _epoch_to_eastern(epoch_seconds: pd.Series) -> pd.Series:
-    """Unix seconds (always UTC) as naive US/Eastern wall-clock datetimes."""
-    utc = pd.to_datetime(epoch_seconds, unit="s", utc=True, errors="coerce")
-    return utc.dt.tz_convert(EASTERN_TIMEZONE).dt.tz_localize(None)
-
-
-def _parse_datetime_column(date_col: pd.Series) -> pd.Series:
-    """Parse a date column to naive US/Eastern datetimes, without the dateutil
-    per-element fallback.
-
-    Handles the formats this code sees: Unix seconds as a number (offline ES
-    files) or as a string (the live IB feed under formatDate=2), and string
-    timestamps from either the IB feed ("YYYYMMDD HH:MM:SS", sometimes
-    double-spaced) or pandas/ISO ("YYYY-MM-DD HH:MM:SS"). Passing an explicit
-    format / "mixed" avoids pandas' "Could not infer format" warning, which is
-    both noisy and slow in the live per-bar loop.
-
-    Unix seconds are UTC and are converted to Eastern. Date strings carry no
-    zone and are taken to be Eastern already.
+def _time_features(dt: pd.Series, n: int) -> dict[str, np.ndarray]:
     """
-    if pd.api.types.is_numeric_dtype(date_col):
-        return _epoch_to_eastern(date_col)
-    cleaned = date_col.astype(str).str.strip().str.replace("  ", " ", regex=False)
-    # The TWS API hands epoch seconds back as a *string* under formatDate=2, so a
-    # column of all-digit strings is still Unix seconds and must not go down the
-    # date-string path — neither format below matches it, which would silently
-    # yield NaT and turn every time-of-day feature into NaN.
-    as_epoch = pd.to_numeric(cleaned, errors="coerce")
-    if as_epoch.notna().all():
-        return _epoch_to_eastern(as_epoch)
-    parsed = pd.to_datetime(cleaned, format="%Y%m%d %H:%M:%S", errors="coerce")
-    if parsed.isna().all():  # not the IB compact format — fall back to general parsing
-        parsed = pd.to_datetime(cleaned, errors="coerce", format="mixed")
-    return parsed
-
-
-def _time_features(date_col: pd.Series, n: int) -> dict[str, np.ndarray]:
-    """
-    Compute time-of-day and calendar features from a date column, in US/Eastern.
+    Compute time-of-day and calendar features from US/Eastern datetimes.
 
     Each definition mirrors futures_price.py, which built the training data:
     hour_sin/hour_cos use the whole hour, while the two Hours_From_* features are
-    exact to the second. Falls back to NaN arrays on any parse error.
+    exact to the second. Falls back to NaN arrays on any error.
     """
     try:
-        dt          = _parse_datetime_column(date_col)
         whole_hour  = dt.dt.hour.values.astype(np.float64)
         exact_hours = (whole_hour
                        + dt.dt.minute.values / 60.0
@@ -490,7 +454,9 @@ def _build_all_feature_arrays(df: pd.DataFrame) -> dict[str, np.ndarray]:
     # ── Time features (optional — NaN when no date column present) ──────────
     date_col = next((c for c in ("date", "DateTime", "Date") if c in df.columns), None)
     if date_col is not None:
-        arrays.update(_time_features(df[date_col], n))
+        eastern_times = parse_to_eastern(df[date_col]).reset_index(drop=True)
+        arrays.update(_time_features(eastern_times, n))
+        arrays.update(session_features_for_bars(eastern_times, df, prior_session_ranges()))
     else:
         nan_arr = np.full(n, np.nan, dtype=np.float64)
         for key in ("Hours_From_Formal_Trading", "Hours_From_Overnight_Trading",

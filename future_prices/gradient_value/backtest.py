@@ -59,8 +59,9 @@ COST_PER_CONTRACT = COMMISSION_PER_CONTRACT + SLIPPAGE_TICKS * TICK_VALUE
 _BARS_PER_YEAR = 4680 * 252
 
 
-def load_test_split() -> tuple[np.ndarray, np.ndarray]:
-    """Return (close_prices, up_probabilities) for the held-out test split.
+def load_test_frame(extra_columns: tuple[str, ...] = ()) -> pd.DataFrame:
+    """The held-out test split: DateTime, Close, any extra_columns, and each bar's
+    up-probability in a "probability" column.
 
     Replicates train_predictor.py's preprocessing exactly: dedup by timestamp,
     drop rows with missing features/target, then take the final TEST_FRACTION.
@@ -68,7 +69,8 @@ def load_test_split() -> tuple[np.ndarray, np.ndarray]:
     bundle = joblib.load(MODEL_PKL)
     model, feature_cols = bundle["model"], bundle["feature_cols"]
 
-    columns = ["DateTime", "Close", *feature_cols, "target_avg5_close_pct"]
+    kept_columns = ["DateTime", "Close", *extra_columns]
+    columns = list(dict.fromkeys([*kept_columns, *feature_cols, "target_avg5_close_pct"]))
     df = pd.read_csv(INPUT_CSV, usecols=columns)
     df = df.drop_duplicates(subset="DateTime", keep="first").reset_index(drop=True)
 
@@ -77,10 +79,15 @@ def load_test_split() -> tuple[np.ndarray, np.ndarray]:
     df = df[target_present & features_present].reset_index(drop=True)
 
     split = int(len(df) * (1 - TEST_FRACTION))
-    test = df.iloc[split:]
+    test = df.iloc[split:].reset_index(drop=True)
+    test["probability"] = model.predict_proba(test[feature_cols])[:, 1]
+    return test[[*kept_columns, "probability"]]
 
-    probabilities = model.predict_proba(test[feature_cols])[:, 1]
-    return test["Close"].to_numpy(float), probabilities
+
+def load_test_split() -> tuple[np.ndarray, np.ndarray]:
+    """Return (close_prices, up_probabilities) for the held-out test split."""
+    test = load_test_frame()
+    return test["Close"].to_numpy(float), test["probability"].to_numpy()
 
 
 def positions_from_probabilities(

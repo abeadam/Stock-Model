@@ -108,13 +108,21 @@ ASI_FEATURES = [
     "asi_bear_14_lag4", "asi_bear_14_lag5",
 ]
 
+SESSION_FEATURES = [
+    # Where the bar sits within today's session (basic_model/session_features.py).
+    "session_vwap_dist", "session_vwap_above_frac", "session_return_pct",
+    "session_move_vs_prior_range", "session_range_position", "session_efficiency_ratio",
+]
+
 _BEST = BASE_FEATURES + LAG_FEATURES + BB_DIST_FEATURES + EMA_FEATURES
 _BEST_PLUS_ASI = _BEST + ASI_FEATURES
+_BEST_PLUS_ASI_SESSION = _BEST_PLUS_ASI + SESSION_FEATURES
 
-# Sweep both so the test-set metrics directly show the uplift from adding ASI.
+# Sweep all three so the test-set metrics directly show each addition's uplift.
 FEATURE_SETS = {
     "best_so_far": _BEST,
     "best_plus_asi": _BEST_PLUS_ASI,
+    "best_plus_asi_session": _BEST_PLUS_ASI_SESSION,
 }
 
 # ── LightGBM hyperparameters ────────────────────────────────────────────────

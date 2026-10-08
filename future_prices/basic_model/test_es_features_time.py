@@ -25,6 +25,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import es_features  # noqa: E402
+from market_clock import parse_to_eastern  # noqa: E402
 import futures_price  # noqa: E402
 
 TIME_FEATURES = (
@@ -58,7 +59,7 @@ def training_time_features(epochs: list[int]) -> pd.DataFrame:
 
 
 def live_time_features(date_column: pd.Series) -> dict[str, np.ndarray]:
-    return es_features._time_features(date_column, len(date_column))
+    return es_features._time_features(parse_to_eastern(date_column), len(date_column))
 
 
 class LiveMatchesTrainingTest(unittest.TestCase):

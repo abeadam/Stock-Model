@@ -53,6 +53,7 @@ from lightgbm_utils import (  # noqa: E402
     prepare_features_and_target,
     apply_top_n_features_from_csv_or_correlation,
 )
+from session_features import SESSION_FEATURE_NAMES  # noqa: E402
 
 # ── Constants ──────────────────────────────────────────────────────────────
 _ASINH_SCALE = 50.0   # matches ASINH_SCALE used during training
@@ -240,6 +241,10 @@ def main() -> None:
         "asi_bear_28":  df["ASI_Bear_28"].values,
         **{f"asi_bull_14_lag{k}": df["ASI_Bull_14"].shift(k).values for k in range(1, 6)},
         **{f"asi_bear_14_lag{k}": df["ASI_Bear_14"].shift(k).values for k in range(1, 6)},
+        # ── session context (basic_model/session_features.py) ─────────────
+        # Where this bar sits within today's session: VWAP, return and range
+        # since the open, and how directly price has travelled.
+        **{name: df[name].values for name in SESSION_FEATURE_NAMES},
         # ── target ─────────────────────────────────────────────────────────
         "target_avg5_close_pct": pd.concat(
             [df["Close"].pct_change().shift(-i) for i in range(1, 6)], axis=1
