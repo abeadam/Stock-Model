@@ -5,28 +5,28 @@ Cost per fill: $15.00 (commission + slippage)
 
 Top 8 configurations by validation net P&L:
   policy    buy   sell     val_net_pnl   val_trades
-   hold   0.75   0.20  $     229,488        9,525
-   hold   0.80   0.25  $     226,932       10,166
-   hold   0.80   0.20  $     224,882        8,246
-   hold   0.75   0.25  $     220,972       12,303
-   hold   0.80   0.30  $     217,012       12,335
-   hold   0.75   0.15  $     212,428        7,157
-   hold   0.80   0.15  $     210,442        6,374
-   hold   0.70   0.20  $     206,922       10,423
+   hold   0.65   0.40  $      14,992           74
+   hold   0.60   0.35  $      14,730            9
+   hold   0.60   0.30  $      14,695            1
+   hold   0.60   0.25  $      14,695            1
+   hold   0.60   0.20  $      14,695            1
+   hold   0.60   0.15  $      14,695            1
+   hold   0.60   0.10  $      14,695            1
+   hold   0.55   0.30  $      14,332            1
 
-Chosen: policy=hold  buy=0.75  sell=0.20
+Chosen: policy=hold  buy=0.65  sell=0.40
 
 Held-out TEST half with chosen thresholds:
-  Bars:                 372,790
+  Bars:                 525,955
   Exposure:             100.0%
-  Trades:               8,984
-  Directional accuracy: 53.78%
-  Net P&L:              $360,605.00
-    Gross P&L:          $630,125.00
-    Commission:         $44,920.00
-    Slippage:           $224,600.00
-  Buy & hold:           $-4,550.00
-  Win rate:             68.68%
-  Profit factor:        5.628
-  Sharpe (annualized):  38.68
-  Max drawdown:         $-6,147.50
+  Trades:               300
+  Directional accuracy: 50.02%
+  Net P&L:              $-8,062.50
+    Gross P&L:          $937.50
+    Commission:         $1,500.00
+    Slippage:           $7,500.00
+  Buy & hold:           $4,600.00
+  Win rate:             64.33%
+  Profit factor:        1.019
+  Sharpe (annualized):  -0.89
+  Max drawdown:         $-22,402.50
