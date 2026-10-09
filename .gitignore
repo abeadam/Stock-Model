@@ -39,3 +39,12 @@ future_prices/gradient_value/model_input.csv
 # Tool state (Claude Code worktrees, Serena cache)
 .claude/
 .serena/
+
+# Weekly pipeline working files: backups of replaced data, run logs and reports
+weekly_update/backups/
+weekly_update/logs/
+weekly_update/reports/
+
+# Local leftovers: a copy of an old research scratchpad, and a symlink into another checkout
+scratchpad_backup/
+/Updated
